@@ -6,6 +6,21 @@
 
 [中文](./CHANGELOG.md) | [English](./CHANGELOG.en.md)
 
+## v1.3.3 (MihonSY)
+
+**MihonSY 1.3.3 (15)**
+
+- **Fixed** Correct the conservative 1.3.2 cold-device NPU vote: use a scoped TURBO floor during active inference and release it immediately afterwards. Light thermal status permits dynamic boost; moderate/greater limits and critical pauses remain.
+- **Improved** Prefer model-lifetime registered QNN shared I/O to reduce per-tile staging. Retain ordinary buffers when RPC allocation/registration is unavailable; retry ordinary I/O once if shared execution fails.
+- **Fixed** Deregister shared buffers before freeing storage or the owning QNN context, including initialization failure and model switching.
+- **Improved** Reuse alpha across scaled pixel runs during output conversion, preserving pixel values and transparency.
+- **Added** Bounded whole-image and per-pass millisecond diagnostics with original/input/output dimensions, queue time, processing time, actual engine and thermal state.
+- **Added** QNN shared/ordinary I/O, tile count, graph execution, cooling wait and input/output conversion profiles.
+- **Fixed** Include native inference profiles in exported logs instead of exporting only error-level logcat output.
+- **Improved** Regression checks for shared-memory ownership/failure paths, release ordering and cropped/transparent output equivalence.
+
+The ESRGAN model, weights, quantization, tile overlap and genuine multi-pass 3x/4x pipeline remain the same. Completed whole images are shown once. A 0.4-second whole-image cache-miss target has not been verified on OnePlus Ace 5; no fixed speedup or temperature claim is made. Existing 36 MP protection can reduce the requested scale or skip oversized images.
+
 ## v1.3.2 (MihonSY)
 
 **MihonSY 1.3.2 (14)**

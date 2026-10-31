@@ -83,6 +83,32 @@ static void output_geometry_and_alpha() {
   }
 }
 
+template <typename T>
+static void cropped_output_mapping() {
+  std::mt19937 rng(133);
+  std::array<uint8_t, 65536> table{};
+  for (auto &v : table) v = static_cast<uint8_t>(rng());
+  const int side = 64;
+  std::vector<T> tensor(side * side * 3);
+  for (auto &v : tensor) v = static_cast<T>(rng());
+  std::vector<uint8_t> input(96 * 96 * 4);
+  for (auto &v : input) v = static_cast<uint8_t>(rng());
+  for (int scale : {2, 3, 4, 6}) for (int tx : {0, 1, 2, 7}) for (int cw : {1, 5, 17}) {
+    const int stride = 128 * 4 + 13, ty = 7, ch = 19, halo = 3;
+    std::vector<uint8_t> result(stride * 128, 23);
+    auto reference = result;
+    for (int y = 0; y < ch; ++y) for (int x = 0; x < cw; ++x) {
+      auto *pixel = reference.data() + (ty + y) * stride + (tx + x) * 4;
+      for (int c = 0; c < 3; ++c)
+        pixel[c] = table[tensor[((halo + y) * side + halo + x) * 3 + c]];
+      pixel[3] = input[((ty + y) / scale * 96 + (tx + x) / scale) * 4 + 3];
+    }
+    unpack_tile(tensor.data(), side, halo, table.data(), result.data(), stride,
+                tx, ty, cw, ch, input.data(), 96 * 4, scale);
+    assert(result == reference);
+  }
+}
+
 static void gray_and_cache() {
   uint8_t gray[] = {90, 94, 98, 77};
   uint8_t color[] = {90, 94, 99, 77};
@@ -215,6 +241,8 @@ static void benchmark() {
 int main() {
   conversion_and_edges();
   output_geometry_and_alpha();
+  cropped_output_mapping<uint8_t>();
+  cropped_output_mapping<uint16_t>();
   gray_and_cache();
   gray_mapping_regression();
   fp16_and_int8();

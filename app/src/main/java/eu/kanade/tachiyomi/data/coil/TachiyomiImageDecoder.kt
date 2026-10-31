@@ -266,10 +266,14 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
                         // 的那一页再也不会重建」。
                         val aiEngine = Waifu2x.engineFor(options.pageIndex)
                         if (enhanceOk && aiEngine != Waifu2x.EngineKind.NONE) {
-                            EnhanceTimings.put(
-                                options.pageIndex,
-                                (android.os.SystemClock.uptimeMillis() - decodeStart) -
-                                    gpuWaitMs.coerceAtLeast(0L),
+                            val elapsed = android.os.SystemClock.uptimeMillis() - decodeStart
+                            val processing = elapsed - gpuWaitMs.coerceAtLeast(0L)
+                            EnhanceTimings.put(options.pageIndex, processing)
+                            eu.kanade.tachiyomi.util.EnhancementDiagnostics.record(
+                                "Image computed page=${options.pageIndex} original=${srcWidth}x$srcHeight " +
+                                    "aiInput=${bitmap.width}x${bitmap.height} " +
+                                    "output=${enhanced?.width}x${enhanced?.height} scale=${preferences.aiScale.get()} " +
+                                    "processing=${processing}ms elapsed=${elapsed}ms queueAndRetry=${gpuWaitMs}ms engine=$aiEngine",
                             )
                         }
                         if (enhanced != null && enhanced !== bitmap && !enhanced.isRecycled) {

@@ -5,6 +5,7 @@ import android.content.res.AssetManager
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.PowerManager
+import eu.kanade.tachiyomi.util.EnhancementDiagnostics
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -451,6 +452,11 @@ object Waifu2x {
             timing?.waitMs = waitMs
             timing?.procMs = procMs
             timing?.nativeInferenceMs = pureMs
+            EnhancementDiagnostics.record(
+                "AI pass page=$id model=${model.id} input=${argb.width}x${argb.height} " +
+                    "wait=${waitMs}ms process=${procMs}ms native=${pureMs}ms " +
+                    "engine=$processedEngine thermal=$thermalStatus success=${out != null && out !== argb}",
+            )
 
             // Komiho 诊断：把「排队等待」与「纯推理」拆开。
             // ⚠️ 老脚本按 `total=…ms src=… from=…` 解析，所以新字段一律追加在 `from=` **之后**。
@@ -559,6 +565,10 @@ object Waifu2x {
      * [exh.log.DiagnosticLogBuffer.getLogsMerged]。老 .so 没有这个符号时返回空串
      * （导出退化为「只有 Kotlin 侧两个来源」，不阻断导出）。
      */
+    fun performanceState(): String =
+        "model=${requestedModel.id} engine=$lastEngine thermal=$thermalStatus " +
+            "webtoon=$webtoonActive scrolling=$webtoonScrolling tilePreference=$requestedTileSize"
+
     fun nativeLogs(): String = try {
         if (libraryLoaded) nativeGetLogs().orEmpty() else ""
     } catch (_: Throwable) {

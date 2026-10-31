@@ -10,6 +10,7 @@ import eu.kanade.tachiyomi.util.system.WebViewUtil
 import eu.kanade.tachiyomi.util.system.createFileInCacheDir
 import eu.kanade.tachiyomi.util.system.toShareIntent
 import eu.kanade.tachiyomi.util.system.toast
+import eu.kanade.tachiyomi.util.waifu2x.Waifu2x
 import exh.syDebugVersion
 import tachiyomi.core.common.util.lang.withNonCancellableContext
 import tachiyomi.core.common.util.lang.withUIContext
@@ -28,11 +29,19 @@ class CrashLogUtil(
         try {
             val file = context.createFileInCacheDir("tachiyomi_sy_crash_logs.txt")
 
-            file.appendText(getDebugInfo() + "\n\n")
+            file.writeText(getDebugInfo() + "\n\n")
             getExtensionsInfo()?.let { file.appendText("$it\n\n") }
             exception?.let { file.appendText("$it\n\n") }
 
-            Runtime.getRuntime().exec("logcat *:E -d -v year -v zone -f ${file.absolutePath}").waitFor()
+            val process = ProcessBuilder(
+                "logcat", "-d", "-v", "year", "-v", "zone",
+                "--pid=${android.os.Process.myPid()}", "*:E",
+            ).redirectErrorStream(true).start()
+            process.inputStream.bufferedReader().use { file.appendText(it.readText()) }
+            process.waitFor()
+            file.appendText("\n\nAI performance state\n${Waifu2x.performanceState()}\n")
+            file.appendText("\nRecent image processing\n${EnhancementDiagnostics.snapshot()}\n")
+            file.appendText("\nNative inference profiles\n${Waifu2x.nativeLogs()}\n")
 
             val uri = file.getUriCompat(context)
             context.startActivity(uri.toShareIntent(context, "text/plain"))

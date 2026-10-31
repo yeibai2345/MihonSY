@@ -9,10 +9,10 @@ class QnnPowerVote {
   QnnPowerVote(const QnnPowerVote &) = delete;
   QnnPowerVote &operator=(const QnnPowerVote &) = delete;
 
-  bool apply(int thermal) {
+  bool apply(int thermal, bool legacy = false) {
     if (thermal >= 4) { release(); return false; }
     if (failed_) return false;
-    if (active_ && level_ == thermal) return true;
+    if (active_ && level_ == thermal && legacy_ == legacy) return true;
     if (!infra_.createPowerConfigId || !infra_.setPowerConfig || !infra_.destroyPowerConfigId) {
       failed_ = true;
       return false;
@@ -34,10 +34,14 @@ class QnnPowerVote {
     config.setSleepDisable = 1;
     config.sleepDisable = 0;
     const auto target = thermal >= 3 ? DCVS_VOLTAGE_VCORNER_SVS_PLUS
-        : thermal >= 2 ? DCVS_VOLTAGE_VCORNER_NOM : DCVS_VOLTAGE_VCORNER_NOM_PLUS;
-    const auto maximum = thermal <= 0 ? DCVS_VOLTAGE_VCORNER_TURBO : target;
+        : thermal >= 2 ? DCVS_VOLTAGE_VCORNER_NOM
+        : thermal == 1 || legacy ? DCVS_VOLTAGE_VCORNER_NOM_PLUS : DCVS_VOLTAGE_VCORNER_TURBO;
+    const auto maximum = thermal <= 1 && !(legacy && thermal == 1) ? DCVS_VOLTAGE_VCORNER_TURBO : target;
     config.setBusParams = config.setCoreParams = 1;
-    config.busVoltageCornerMin = config.coreVoltageCornerMin = DCVS_VOLTAGE_VCORNER_SVS2;
+    // A cold, active inference gets a burst floor. Scope destruction still removes
+    // the entire request when work ends; warming immediately restores a DCVS range.
+    config.busVoltageCornerMin = config.coreVoltageCornerMin =
+        thermal == 0 && !legacy ? DCVS_VOLTAGE_VCORNER_TURBO : DCVS_VOLTAGE_VCORNER_SVS2;
     config.busVoltageCornerTarget = config.coreVoltageCornerTarget = target;
     config.busVoltageCornerMax = config.coreVoltageCornerMax = maximum;
 
@@ -51,6 +55,7 @@ class QnnPowerVote {
       return false;
     }
     level_ = thermal;
+    legacy_ = legacy;
     return true;
   }
 
@@ -66,4 +71,5 @@ class QnnPowerVote {
   int level_ = -1;
   bool active_ = false;
   bool failed_ = false;
+  bool legacy_ = false;
 };

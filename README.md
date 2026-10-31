@@ -6,7 +6,7 @@
 
 **基于 TachiyomiSY 的漫画阅读器，主打图像增强、条漫阅读增强与多设备同步**
 
-包名 `eu.kanade.mihonsy` ｜ 版本 1.3.2 (14) ｜ Android 8.0+
+包名 `eu.kanade.mihonsy` ｜ 版本 1.3.3 (15) ｜ Android 8.0+
 
 [中文](./README.md) | [English](./README.en.md)
 

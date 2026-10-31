@@ -141,11 +141,19 @@ void unpack_tile(const T *source, int source_side, int source_offset,
     const auto *source_row = source +
         (static_cast<size_t>(source_offset + y) * source_side + source_offset) * 3;
     const auto *alpha_row = input + static_cast<size_t>((target_y + y) / scale) * input_stride;
-    for (int x = 0; x < copy_width; ++x) {
-      row[x * 4] = table[source_row[x * 3]];
-      row[x * 4 + 1] = table[source_row[x * 3 + 1]];
-      row[x * 4 + 2] = table[source_row[x * 3 + 2]];
-      row[x * 4 + 3] = alpha_row[((target_x + x) / scale) * 4 + 3];
+    int phase = target_x % scale;
+    int alpha_x = target_x / scale;
+    for (int x = 0; x < copy_width;) {
+      const int run = std::min(scale - phase, copy_width - x);
+      const auto alpha = alpha_row[alpha_x * 4 + 3];
+      for (int dx = 0; dx < run; ++dx, ++x) {
+        row[x * 4] = table[source_row[x * 3]];
+        row[x * 4 + 1] = table[source_row[x * 3 + 1]];
+        row[x * 4 + 2] = table[source_row[x * 3 + 2]];
+        row[x * 4 + 3] = alpha;
+      }
+      ++alpha_x;
+      phase = 0;
     }
   }
 }

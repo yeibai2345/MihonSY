@@ -6,15 +6,22 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "ci = test APK; unsigned = release for local signing; formal = signed GitHub release"
+        description: "ci = test APK; unsigned = local signing; candidate = signed artifact; formal = GitHub release"
         type: choice
-        options: [ci, unsigned, formal]
+        options: [ci, unsigned, candidate, formal]
         default: ci
+      prerelease:
+        description: "Publish formal mode as a test release without changing latest"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       mode:
         type: string
         default: ci
+      prerelease:
+        type: boolean
+        default: false
 
 concurrency:
   group: mihonsy-${{ github.workflow }}-${{ github.ref }}
@@ -45,7 +52,7 @@ jobs:
           fi
           echo "value=$MODE" >> "$GITHUB_OUTPUT"
       - name: Prepare release signing
-        if: steps.mode.outputs.value == 'formal'
+        if: steps.mode.outputs.value == 'formal' || steps.mode.outputs.value == 'candidate'
         env:
           KEYSTORE_BASE64: ${{ secrets.MIHONSY_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.MIHONSY_KEYSTORE_PASSWORD }}
@@ -66,6 +73,8 @@ jobs:
           /tmp/upscale-pixels-test
           c++ -std=c++17 -O2 -pthread -I app/src/main/cpp -I app/src/main/cpp/include/QNN app/src/test/cpp/inference_control_test.cpp -o /tmp/inference-control-test
           /tmp/inference-control-test
+          c++ -std=c++17 -O2 -I app/src/main/cpp -I app/src/main/cpp/include/QNN app/src/test/cpp/qnn_shared_io_test.cpp -o /tmp/qnn-shared-io-test
+          /tmp/qnn-shared-io-test
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest :domain:test --no-daemon --stacktrace
       - name: Build test APK
@@ -75,20 +84,22 @@ jobs:
         if: steps.mode.outputs.value == 'unsigned'
         run: ./gradlew :app:assembleRelease -Pdisable-code-shrink -PmihonsyUnsigned=true -PmihonsyAbi=arm64-v8a -PmihonsyUniversal=true --no-daemon --stacktrace
       - name: Build signed release APK
-        if: steps.mode.outputs.value == 'formal'
+        if: steps.mode.outputs.value == 'formal' || steps.mode.outputs.value == 'candidate'
         env:
           MIHONSY_STORE_PASSWORD: ${{ secrets.MIHONSY_KEYSTORE_PASSWORD }}
           MIHONSY_KEY_PASSWORD: ${{ secrets.MIHONSY_KEY_PASSWORD || secrets.MIHONSY_KEYSTORE_PASSWORD }}
           MIHONSY_KEY_ALIAS: ${{ secrets.MIHONSY_KEY_ALIAS }}
         run: ./gradlew :app:assembleRelease -Pdisable-code-shrink -PmihonsyAbi=arm64-v8a -PmihonsyUniversal=true --no-daemon --stacktrace
       - name: Prepare verified release assets
-        if: steps.mode.outputs.value == 'formal'
+        if: steps.mode.outputs.value == 'formal' || steps.mode.outputs.value == 'candidate'
         id: release
+        env:
+          BUILD_MODE: ${{ steps.mode.outputs.value }}
         run: |
           VERSION=$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts | head -1)
           test -n "$VERSION"
           TAG="v$VERSION"
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+          if [ "$BUILD_MODE" = "formal" ] && git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
             echo "::error::Tag $TAG already exists. Bump versionName before publishing."
             exit 1
           fi
@@ -117,8 +128,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease }}
         run: |
+          RELEASE_FLAGS=(--latest)
+          if [ "$RELEASE_PRERELEASE" = "true" ]; then
+            RELEASE_FLAGS=(--prerelease --latest=false)
+          fi
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "MihonSY $RELEASE_VERSION" --latest \
+            --title "MihonSY $RELEASE_VERSION" "${RELEASE_FLAGS[@]}" \
             --notes-file release-assets/RELEASE_NOTES.md \
             release-assets/*.apk release-assets/SHA256SUMS.txt

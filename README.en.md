@@ -6,7 +6,7 @@
 
 **A manga reader based on [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY), focused on image enhancement, an enhanced webtoon experience and multi-device sync**
 
-Package `eu.kanade.mihonsy` ｜ Version 1.3.2 (14) ｜ Android 8.0+
+Package `eu.kanade.mihonsy` ｜ Version 1.3.3 (15) ｜ Android 8.0+
 
 [English](./README.en.md) | [中文](./README.md)
 

@@ -4,6 +4,7 @@
 #include "qnn_backend.h"
 #include "upscale_pixels.h"
 #include "native_log.h"
+#include "adb_diagnostics.h"
 
 #include <algorithm>
 #include <android/log.h>
@@ -20,6 +21,7 @@
 
 #if MIHON_ENABLE_QNN
 #include "qnn_power.h"
+#include "qnn_shared_io.h"
 #include <HTP/QnnHtpDevice.h>
 #include <QnnInterface.h>
 #include <System/QnnSystemInterface.h>
@@ -459,6 +461,8 @@ public:
         },
         is_quant8_tensor(output_) ? 256 : 65536);
     input_x_coordinates_.resize(tile_size_);
+    use_client_buffers();
+    initialize_shared_io();
     padding_ = std::clamp(padding, 0, 48);
     configure_performance();
     initialized_ = true;
@@ -489,6 +493,10 @@ public:
     std::chrono::nanoseconds prepare_time{0};
     std::chrono::nanoseconds execute_time{0};
     std::chrono::nanoseconds output_time{0};
+    std::chrono::nanoseconds graph_time{0};
+    std::chrono::nanoseconds cooling_time{0};
+    const int initial_thermal = thermal_status.load();
+    const bool legacy_power = diagnostic_property("debug.mihonsy.npu_power", "legacy");
 
     for (int tile_y = 0; tile_y < height; tile_y += core) {
       for (int tile_x = 0; tile_x < width; tile_x += core) {
@@ -501,28 +509,41 @@ public:
         prepare_time += std::chrono::steady_clock::now() - stage_start;
         const auto &qnn = provider_->QNN_INTERFACE_VER_NAME;
         stage_start = std::chrono::steady_clock::now();
-        const size_t output_bytes = output_.v2.clientBuf.dataSize;
+        const size_t output_bytes = output_bytes_;
         const auto *cached = uniform_tiles_.find(uniform_color, output_bytes);
         Qnn_ErrorHandle_t status = QNN_SUCCESS;
         if (cached) {
-          std::memcpy(output_.v2.clientBuf.data, cached, output_bytes);
+          std::memcpy(output_data_, cached, output_bytes);
           ++cached_tiles;
         } else {
           // At critical temperature release the vote while waiting. The request-scoped
           // cancellation signal still ends this wait when the reader leaves the page.
+          const auto cooling_start = std::chrono::steady_clock::now();
           while (thermal_status.load() >= 4) {
             power.release();
             if (should_abort && should_abort->load()) return -2;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
           }
+          cooling_time += std::chrono::steady_clock::now() - cooling_start;
           if (should_abort && should_abort->load()) return -2;
-          if (!power.apply(thermal_status.load()) && !power_warning_logged) {
+          if (!power.apply(thermal_status.load(), legacy_power) && !power_warning_logged) {
             LOGE("QNN performance hint unavailable; using system-managed power policy");
             power_warning_logged = true;
           }
+          const auto graph_start = std::chrono::steady_clock::now();
           status = qnn.graphExecute(graph_, &input_, 1, &output_, 1, nullptr, nullptr);
+          if (status != QNN_SUCCESS && shared_io_.active()) {
+            LOGW("QNN shared I/O execute rejected: %u; retrying ordinary buffers", static_cast<unsigned>(status));
+            const auto *shared_input = input_data_;
+            use_client_buffers();
+            std::memcpy(input_data_, shared_input, input_bytes_);
+            shared_io_.reset();
+            if (should_abort && should_abort->load()) return -2;
+            status = qnn.graphExecute(graph_, &input_, 1, &output_, 1, nullptr, nullptr);
+          }
+          graph_time += std::chrono::steady_clock::now() - graph_start;
           if (status == QNN_SUCCESS)
-            uniform_tiles_.remember(uniform_color, output_.v2.clientBuf.data, output_bytes);
+            uniform_tiles_.remember(uniform_color, output_data_, output_bytes);
         }
         execute_time += std::chrono::steady_clock::now() - stage_start;
         if (status != QNN_SUCCESS) {
@@ -548,7 +569,8 @@ public:
       progress->store(100);
     }
     LOGD("QNN tile profile: count=%d cached=%d tile=%d core=%d prepare=%lldms "
-         "execute=%lldms output=%lldms thermal=%d",
+         "execute=%lldms output=%lldms thermal=%d io=%s input=%dx%d output=%dx%d "
+         "graph=%lldms cooling=%lldms initialThermal=%d power=%s",
          total_tiles, cached_tiles, tile_size_, core,
          static_cast<long long>(
              std::chrono::duration_cast<std::chrono::milliseconds>(prepare_time)
@@ -558,7 +580,11 @@ public:
                  .count()),
          static_cast<long long>(
              std::chrono::duration_cast<std::chrono::milliseconds>(output_time)
-                 .count()), thermal_status.load());
+                 .count()), thermal_status.load(), shared_io_.active() ? "shared" : "ordinary",
+         width, height, width * scale_, height * scale_,
+         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(graph_time).count()),
+         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(cooling_time).count()),
+         initial_thermal, legacy_power ? "legacy" : "scoped-burst");
     return 0;
   }
 
@@ -567,6 +593,9 @@ public:
 
   void deactivate() {
     initialized_ = false;
+    shared_io_.reset();
+    input_data_ = output_data_ = nullptr;
+    input_bytes_ = output_bytes_ = 0;
     if (provider_) {
       const auto &qnn = provider_->QNN_INTERFACE_VER_NAME;
       if (context_ && qnn.contextFree) {
@@ -609,6 +638,10 @@ public:
     backend_ = nullptr;
     provider_ = nullptr;
     system_provider_ = nullptr;
+    if (rpc_library_) {
+      dlclose(rpc_library_);
+      rpc_library_ = nullptr;
+    }
     if (system_library_) {
       dlclose(system_library_);
       system_library_ = nullptr;
@@ -627,6 +660,43 @@ public:
   }
 
 private:
+  void use_client_buffers() {
+    input_data_ = is_fp16_tensor(input_) ? static_cast<void *>(input_fp16_buffer_.data())
+        : is_quant16_tensor(input_) ? static_cast<void *>(input_quant16_buffer_.data())
+        : static_cast<void *>(input_quant8_buffer_.data());
+    output_data_ = is_fp16_tensor(output_) ? static_cast<void *>(output_fp16_buffer_.data())
+        : is_quant16_tensor(output_) ? static_cast<void *>(output_quant16_buffer_.data())
+        : static_cast<void *>(output_quant8_buffer_.data());
+    const size_t input_elements = static_cast<size_t>(tile_size_) * tile_size_ * 3;
+    const size_t output_elements = static_cast<size_t>(output_tile_size_) * output_tile_size_ * 3;
+    input_bytes_ = input_elements * (is_quant8_tensor(input_) ? 1 : 2);
+    output_bytes_ = output_elements * (is_quant8_tensor(output_) ? 1 : 2);
+    set_client_buffer(input_, input_data_, static_cast<uint32_t>(input_bytes_));
+    set_client_buffer(output_, output_data_, static_cast<uint32_t>(output_bytes_));
+  }
+
+  void initialize_shared_io() {
+    if (diagnostic_property("debug.mihonsy.npu_io", "ordinary")) {
+      LOGD("QNN ordinary I/O selected for ADB comparison");
+      return;
+    }
+    if (!rpc_library_) rpc_library_ = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_LOCAL);
+    if (!rpc_library_) { LOGD("QNN RPC allocator unavailable; using ordinary I/O"); return; }
+    RpcMemoryApi api;
+    api.allocate = reinterpret_cast<decltype(api.allocate)>(dlsym(rpc_library_, "rpcmem_alloc"));
+    api.release = reinterpret_cast<decltype(api.release)>(dlsym(rpc_library_, "rpcmem_free"));
+    api.to_fd = reinterpret_cast<decltype(api.to_fd)>(dlsym(rpc_library_, "rpcmem_to_fd"));
+    const auto &qnn = provider_->QNN_INTERFACE_VER_NAME;
+    if (shared_io_.initialize(context_, qnn.memRegister, qnn.memDeRegister, api, input_, output_)) {
+      input_data_ = shared_io_.input_data();
+      output_data_ = shared_io_.output_data();
+      shared_io_.bind(input_, output_);
+      LOGD("QNN model-lifetime registered shared I/O enabled: input=%zu output=%zu bytes", input_bytes_, output_bytes_);
+    } else {
+      LOGD("QNN shared I/O registration unavailable; using ordinary I/O");
+    }
+  }
+
   bool ensure_runtime() {
     if (backend_ && provider_ && system_provider_) {
       return true;
@@ -919,6 +989,7 @@ private:
   }
 
   static void set_client_buffer(Qnn_Tensor_t &tensor, void *data, uint32_t size) {
+    tensor.v2.memType = QNN_TENSORMEMTYPE_RAW;
     tensor.v2.clientBuf.data = data;
     tensor.v2.clientBuf.dataSize = size;
   }
@@ -930,9 +1001,8 @@ private:
                                 tile_size_, pixel_tables_.input.data(), destination,
                                 input_x_coordinates_.data());
     };
-    if (is_fp16_tensor(input_)) return pack(input_fp16_buffer_.data());
-    if (is_quant16_tensor(input_)) return pack(input_quant16_buffer_.data());
-    return pack(input_quant8_buffer_.data());
+    if (is_fp16_tensor(input_) || is_quant16_tensor(input_)) return pack(static_cast<uint16_t *>(input_data_));
+    return pack(static_cast<uint8_t *>(input_data_));
   }
 
   void write_output_tile(uint8_t *output, int output_stride, int target_x,
@@ -945,9 +1015,8 @@ private:
                                   target_x, target_y, copy_width, copy_height,
                                   input, input_stride, scale_);
     };
-    if (is_fp16_tensor(output_)) unpack(output_fp16_buffer_.data());
-    else if (is_quant16_tensor(output_)) unpack(output_quant16_buffer_.data());
-    else unpack(output_quant8_buffer_.data());
+    if (is_fp16_tensor(output_) || is_quant16_tensor(output_)) unpack(static_cast<const uint16_t *>(output_data_));
+    else unpack(static_cast<const uint8_t *>(output_data_));
   }
 
   void *backend_library_ = nullptr;
@@ -980,6 +1049,12 @@ private:
   upscale_pixels::ConversionTables pixel_tables_;
   std::vector<int> input_x_coordinates_;
   upscale_pixels::UniformTileCache uniform_tiles_;
+  QnnSharedIo shared_io_;
+  void *rpc_library_ = nullptr;
+  void *input_data_ = nullptr;
+  void *output_data_ = nullptr;
+  size_t input_bytes_ = 0;
+  size_t output_bytes_ = 0;
   int padding_ = 0;
   int tile_size_ = 0;
   int output_tile_size_ = 0;
