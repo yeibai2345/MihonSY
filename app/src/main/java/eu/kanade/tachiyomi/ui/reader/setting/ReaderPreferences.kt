@@ -260,7 +260,7 @@ class ReaderPreferences(
 
     // MihonSY image enhancement -->
     /** 0 = Off, 1 = Anime4K (disabled), 2 = Lanczos3, 3 = Catmull-Rom, 4 = Spline36 (disabled),
-     *  5 = AI upscale (Komiho: ncnn + Vulkan, fixed 2x model).
+     *  5 = AI upscale (GPU / NPU, chained model passes with 2x–6x output choices).
      *  Single selector so the algorithms never conflict. Anime4K/Spline36 are retained
      *  in the index map for backward-compatible stored values but excluded from the build. */
     val enhancementMode: Preference<Int> = preferenceStore.getInt("pref_enhancement_mode", 0)
@@ -323,8 +323,8 @@ class ReaderPreferences(
      * Komiho (2026-09-26): 放开 AI 尺寸门控。默认关——r≤1（图已 ≥ 屏幕）的源图跳过 AI；
      * 开启后这类图也跑 AI（扫描质量差、需要 AI 补细节的场景），同时解码/预缩目标从视图
      * 尺寸放宽到 2048 上限，AI 才有真实细节可补。OOM 防护不依赖此开关：enhance() 里的
-     * MP 输出门（MihonSyEnhancer.MAX_ENHANCE_OUTPUT_PIXELS = 36MP；AI 固定 2x，即输入面积
-     * >9MP 照样 skip）始终生效。变更进 [enhancementCacheKey] 指纹。
+     * 36MP 输出门始终生效：大图自动降低 AI 倍率，2x 仍超限时保留原图。
+     * 变更进 [enhancementCacheKey] 指纹。
      */
     val aiBypassFitGate: Preference<Boolean> = preferenceStore.getBoolean("pref_ai_bypass_fit_gate", false)
 

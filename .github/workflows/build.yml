@@ -40,7 +40,7 @@ jobs:
           REQUESTED_MODE: ${{ inputs.mode }}
         run: |
           MODE="${REQUESTED_MODE:-ci}"
-          if git log -1 --format=%s | grep -qiE '\[release\]|正式版'; then
+          if [ -z "$REQUESTED_MODE" ] && git log -1 --format=%s | grep -qiE '\[release\]|正式版'; then
             MODE=formal
           fi
           echo "value=$MODE" >> "$GITHUB_OUTPUT"
