@@ -49,6 +49,16 @@ static void power_lifecycle() {
     }
     assert(!vote.apply(4) && destroyed == 1);
     assert(vote.apply(0) && created == 2); // Resume with a new, owned vote after cooling.
+    assert(vote.apply(0, true)); // Same-build ADB baseline uses the 1.3.2 policy.
+    assert(last_config.coreVoltageCornerMin == DCVS_VOLTAGE_VCORNER_SVS2);
+    assert(last_config.coreVoltageCornerTarget == DCVS_VOLTAGE_VCORNER_NOM_PLUS);
+    assert(last_config.coreVoltageCornerMax == DCVS_VOLTAGE_VCORNER_TURBO);
+    const int before_repeat = applied;
+    assert(vote.apply(0, true) && applied == before_repeat);
+    assert(vote.apply(1, true));
+    assert(last_config.coreVoltageCornerMax == DCVS_VOLTAGE_VCORNER_NOM_PLUS);
+    assert(vote.apply(0));
+    assert(last_config.coreVoltageCornerMin == DCVS_VOLTAGE_VCORNER_TURBO);
   }
   assert(destroyed == 2);
   reset(); fail_apply = true;

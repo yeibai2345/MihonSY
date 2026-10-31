@@ -32,6 +32,7 @@ GPU/NPU 推理需要真机验证，JVM 测试覆盖倍率规划、温控准入�
 2. 在中英文 CHANGELOG 中增加对应的 `## vX.Y.Z` 小节，并更新 `app/src/main/res/raw/changelog_release.xml` 的应用内公告。
 3. 推送代码，手动运行 **Build MihonSY APK**，选择 `formal`。也可在 master 的提交标题中加入 `[release]`。
 可勾选 `prerelease` 生成签名预发布包；该模式不会改变 GitHub latest，适合真机验收前分发测试。默认关闭。
+选择 `candidate` 会构建相同签名的 release APK 并上传 artifact，供 USB 覆盖安装验收，不创建标签或 Release。
 
 4. 工作流通过单元测试、构建和签名检查后，会创建 `vX.Y.Z` Release，附上 arm64 APK、universal APK 和 SHA-256 校验文件。
 
@@ -83,3 +84,23 @@ c++ -std=c++17 -O2 -I app/src/main/cpp -I app/src/main/cpp/include/QNN app/src/t
 在相同手机、源图、模型、倍率、降噪/裁边/面积回缩等设置下比较 1.3.2 与本版；两版最终尺寸必须相同。退出条漫阅读器可清理整图结果缓存，重新进入后测量实际计算，区分模型首次加载与后续未命中图片缓存的处理。目标为整图 processing <= 400ms，不能用回看缓存或提前预取的等待时间代替处理时间。
 
 高级设置的日志导出包含 Image computed（完整整图毫秒数）、AI pass（每轮输入和处理）与 QNN tile profile（io/shared、graph、cooling、prepare、output、初始和结束热状态）。图像尺寸、模型信息与 tile 数可检查工作量是否相同。日志仅记录最近 64 条图像/轮次处理信息，原生日志另有有界环。导出前分别处理 3x/4x 测试图片。自动检查覆盖像素转换与资源协议，不能代替真机共享内存、模型输出和 400ms 目标验证。
+
+### USB 对比诊断（默认关闭）
+
+连接已授权的 ADB 后，可用以下属性隔离优化因素。`npu_io=ordinary` 需要强制停止应用、重新进入阅读器才能生效；`npu_power=legacy` 复现 1.3.2 功耗请求，下一轮推理生效。常规用户不需要设置。
+
+```sh
+adb shell setprop debug.mihonsy.npu_io ordinary
+adb shell setprop debug.mihonsy.npu_power legacy
+adb shell setprop debug.mihonsy.verify_pixels 1
+```
+
+`verify_pixels=1` 记录每轮原生输入/输出的 FNV-1a 64 位指纹、尺寸与页号，忽略行尾填充，仅用于检查相同输入是否得到相同输出。这不是加密摘要，也不代替最终画面核验。它额外扫描像素，计时对比前必须关闭。Kotlin 整图/轮次记录同时输出到 `EnhancementProfile` logcat。
+
+完成检查后恢复默认，再重启应用：
+
+```sh
+adb shell setprop debug.mihonsy.npu_io auto
+adb shell setprop debug.mihonsy.npu_power auto
+adb shell setprop debug.mihonsy.verify_pixels 0
+```

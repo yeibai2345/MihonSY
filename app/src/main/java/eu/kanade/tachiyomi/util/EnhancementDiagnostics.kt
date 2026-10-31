@@ -8,6 +8,7 @@ object EnhancementDiagnostics {
     fun record(message: String) {
         if (records.size >= 64) records.removeFirst()
         records.addLast("${System.currentTimeMillis()} $message")
+        android.util.Log.d("EnhancementProfile", message)
     }
 
     @Synchronized

@@ -2,6 +2,7 @@
 #include "qnn_backend.h"
 #include "native_log.h"
 #include "inference_control.h"
+#include "adb_diagnostics.h"
 #include <android/bitmap.h>
 #include <android/log.h>
 #include <algorithm>
@@ -82,6 +83,19 @@ char native_log_level(int android_priority) {
   if (android_priority >= ANDROID_LOG_INFO) return 'I';
   if (android_priority >= ANDROID_LOG_DEBUG) return 'D';
   return 'V';
+}
+
+// A diagnostic fingerprint, not a cryptographic digest. Ignore row padding.
+uint64_t rgba_fingerprint(const uint8_t *pixels, int width, int height, int stride) {
+  uint64_t hash = UINT64_C(14695981039346656037);
+  for (int y = 0; y < height; ++y) {
+    const auto *row = pixels + static_cast<size_t>(y) * stride;
+    for (size_t x = 0; x < static_cast<size_t>(width) * 4; ++x) {
+      hash ^= row[x];
+      hash *= UINT64_C(1099511628211);
+    }
+  }
+  return hash;
 }
 
 } // namespace
@@ -496,6 +510,15 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
           // 能改这个标志（nativeClearAbortProcessing 也要拿锁，插不进来）。
           if (ret != 0 && g_abort_processing.load()) {
             g_last_aborted_id.store(id);
+          }
+
+          // Opt-in only. Disable for timing runs: reading every pixel adds work.
+          if (ret == 0 && diagnostic_property("debug.mihonsy.verify_pixels", "1")) {
+            LOGD("Pixel verification page=%d input=%dx%d fingerprint=%016llx "
+                 "output=%dx%d fingerprint=%016llx (FNV1a64; timing verification enabled)",
+                 id, w, h, static_cast<unsigned long long>(rgba_fingerprint(input_pixels, w, h, input_stride)),
+                 out_w, out_h, static_cast<unsigned long long>(rgba_fingerprint(
+                     static_cast<const uint8_t *>(outPixels), out_w, out_h, outInfo.stride)));
           }
 
           AndroidBitmap_unlockPixels(env, outBitmap);

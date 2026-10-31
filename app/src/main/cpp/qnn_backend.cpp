@@ -4,6 +4,7 @@
 #include "qnn_backend.h"
 #include "upscale_pixels.h"
 #include "native_log.h"
+#include "adb_diagnostics.h"
 
 #include <algorithm>
 #include <android/log.h>
@@ -495,6 +496,7 @@ public:
     std::chrono::nanoseconds graph_time{0};
     std::chrono::nanoseconds cooling_time{0};
     const int initial_thermal = thermal_status.load();
+    const bool legacy_power = diagnostic_property("debug.mihonsy.npu_power", "legacy");
 
     for (int tile_y = 0; tile_y < height; tile_y += core) {
       for (int tile_x = 0; tile_x < width; tile_x += core) {
@@ -524,7 +526,7 @@ public:
           }
           cooling_time += std::chrono::steady_clock::now() - cooling_start;
           if (should_abort && should_abort->load()) return -2;
-          if (!power.apply(thermal_status.load()) && !power_warning_logged) {
+          if (!power.apply(thermal_status.load(), legacy_power) && !power_warning_logged) {
             LOGE("QNN performance hint unavailable; using system-managed power policy");
             power_warning_logged = true;
           }
@@ -568,7 +570,7 @@ public:
     }
     LOGD("QNN tile profile: count=%d cached=%d tile=%d core=%d prepare=%lldms "
          "execute=%lldms output=%lldms thermal=%d io=%s input=%dx%d output=%dx%d "
-         "graph=%lldms cooling=%lldms initialThermal=%d",
+         "graph=%lldms cooling=%lldms initialThermal=%d power=%s",
          total_tiles, cached_tiles, tile_size_, core,
          static_cast<long long>(
              std::chrono::duration_cast<std::chrono::milliseconds>(prepare_time)
@@ -582,7 +584,7 @@ public:
          width, height, width * scale_, height * scale_,
          static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(graph_time).count()),
          static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(cooling_time).count()),
-         initial_thermal);
+         initial_thermal, legacy_power ? "legacy" : "scoped-burst");
     return 0;
   }
 
@@ -674,6 +676,10 @@ private:
   }
 
   void initialize_shared_io() {
+    if (diagnostic_property("debug.mihonsy.npu_io", "ordinary")) {
+      LOGD("QNN ordinary I/O selected for ADB comparison");
+      return;
+    }
     if (!rpc_library_) rpc_library_ = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_LOCAL);
     if (!rpc_library_) { LOGD("QNN RPC allocator unavailable; using ordinary I/O"); return; }
     RpcMemoryApi api;
