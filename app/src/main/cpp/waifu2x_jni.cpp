@@ -706,9 +706,10 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitRealCugan(
 extern "C" JNIEXPORT jobject JNICALL
 Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcessRealCugan(
     JNIEnv *env, jobject thiz, jobject bitmap, jint id) {
-  // Real-CUGAN uses same processing logic as Waifu2x in this simplified impl
+  // Legacy entry point has no request token. Current Kotlin callers use
+  // nativeProcess directly for every model, including Real-CUGAN.
   return Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(
-      env, thiz, bitmap, id);
+      env, thiz, bitmap, id, 0);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
