@@ -64,3 +64,20 @@ c++ -std=c++17 -O2 -pthread -I app/src/main/cpp -I app/src/main/cpp/include/QNN 
 ```
 
 发布前自动检查不包含真实 HTP 推理。一加 Ace 5 / NPU / ESRGAN 应使用相同源图、倍率、设置、亮度及初始温度，分别记录 3x/4x 冷机整图、连续阅读 10–15 分钟、缓存回看、跨章、快速滚动后返回、退出与改倍率。对比最终尺寸和画质，同时记录实际等待、角标耗时、温控等级与机身温度。降低功耗请求可能牺牲单张峰值速度，应以持续阅读数据评估；不得把宿主像素微基准当成手机整图 NPU 性能。
+
+## 1.3.3 NPU 数据路径与验收
+
+冷机（NONE）只在实际推理期间请求 TURBO 最小/目标/最大值。LIGHT 恢复 SVS2–TURBO 的动态范围，目标 NOM_PLUS；MODERATE/SEVERE 延续 1.3.2 的 NOM/SVS_PLUS 上限，CRITICAL 暂停。请求仍允许休眠、关闭 RPC 忙轮询，并随推理结束释放。这会提高冷机瞬时功耗，持续阅读的能耗与温度必须真机评估。
+
+QNN 通过设备 libcdsprpc 的 RPC 分配器与 memRegister 优先注册输入/输出 ION 缓冲，模型会话内复用。模型输入/输出数据类型、查找表、尺寸与权重不变。未支持分配器/注册时沿用普通 I/O；共享执行失败时复制当前输入回普通缓冲、注销共享存储并重试一次，此模型会话不再尝试共享执行。切换模型前先注销共享内存，再释放上下文。
+
+额外宿主检查：
+
+```sh
+c++ -std=c++17 -O2 -I app/src/main/cpp -I app/src/main/cpp/include/QNN app/src/test/cpp/qnn_shared_io_test.cpp -o /tmp/qnn-shared-io-test
+/tmp/qnn-shared-io-test
+```
+
+在相同手机、源图、模型、倍率、降噪/裁边/面积回缩等设置下比较 1.3.2 与本版；两版最终尺寸必须相同。退出条漫阅读器可清理整图结果缓存，重新进入后测量实际计算，区分模型首次加载与后续未命中图片缓存的处理。目标为整图 processing <= 400ms，不能用回看缓存或提前预取的等待时间代替处理时间。
+
+高级设置的日志导出包含 Image computed（完整整图毫秒数）、AI pass（每轮输入和处理）与 QNN tile profile（io/shared、graph、cooling、prepare、output、初始和结束热状态）。图像尺寸、模型信息与 tile 数可检查工作量是否相同。日志仅记录最近 64 条图像/轮次处理信息，原生日志另有有界环。导出前分别处理 3x/4x 测试图片。自动检查覆盖像素转换与资源协议，不能代替真机共享内存、模型输出和 400ms 目标验证。

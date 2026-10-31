@@ -66,6 +66,8 @@ jobs:
           /tmp/upscale-pixels-test
           c++ -std=c++17 -O2 -pthread -I app/src/main/cpp -I app/src/main/cpp/include/QNN app/src/test/cpp/inference_control_test.cpp -o /tmp/inference-control-test
           /tmp/inference-control-test
+          c++ -std=c++17 -O2 -I app/src/main/cpp -I app/src/main/cpp/include/QNN app/src/test/cpp/qnn_shared_io_test.cpp -o /tmp/qnn-shared-io-test
+          /tmp/qnn-shared-io-test
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest :domain:test --no-daemon --stacktrace
       - name: Build test APK

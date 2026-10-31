@@ -32,13 +32,19 @@ static void power_lifecycle() {
     assert(vote.apply(0));
     assert(created == 1 && applied == 1);
     assert(last_config.dcvsEnable == 1 && last_config.sleepDisable == 0);
-    assert(last_config.coreVoltageCornerMin < last_config.coreVoltageCornerMax);
+    assert(last_config.coreVoltageCornerMin == DCVS_VOLTAGE_VCORNER_TURBO);
+    assert(last_config.coreVoltageCornerTarget == DCVS_VOLTAGE_VCORNER_TURBO);
     assert(last_config.coreVoltageCornerMax < DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER);
     assert(vote.apply(0) && applied == 1); // No per-tile RPC overhead at stable temperature.
     auto previous_max = last_config.coreVoltageCornerMax;
     for (int level = 1; level <= 3; ++level) {
       assert(vote.apply(level));
-      assert(last_config.coreVoltageCornerMax < previous_max);
+      assert(last_config.coreVoltageCornerMax <= previous_max);
+      assert(last_config.coreVoltageCornerMin < last_config.coreVoltageCornerMax);
+      if (level == 1) {
+        assert(last_config.coreVoltageCornerTarget == DCVS_VOLTAGE_VCORNER_NOM_PLUS);
+        assert(last_config.coreVoltageCornerMax == DCVS_VOLTAGE_VCORNER_TURBO);
+      }
       previous_max = last_config.coreVoltageCornerMax;
     }
     assert(!vote.apply(4) && destroyed == 1);

@@ -34,10 +34,14 @@ class QnnPowerVote {
     config.setSleepDisable = 1;
     config.sleepDisable = 0;
     const auto target = thermal >= 3 ? DCVS_VOLTAGE_VCORNER_SVS_PLUS
-        : thermal >= 2 ? DCVS_VOLTAGE_VCORNER_NOM : DCVS_VOLTAGE_VCORNER_NOM_PLUS;
-    const auto maximum = thermal <= 0 ? DCVS_VOLTAGE_VCORNER_TURBO : target;
+        : thermal >= 2 ? DCVS_VOLTAGE_VCORNER_NOM
+        : thermal == 1 ? DCVS_VOLTAGE_VCORNER_NOM_PLUS : DCVS_VOLTAGE_VCORNER_TURBO;
+    const auto maximum = thermal <= 1 ? DCVS_VOLTAGE_VCORNER_TURBO : target;
     config.setBusParams = config.setCoreParams = 1;
-    config.busVoltageCornerMin = config.coreVoltageCornerMin = DCVS_VOLTAGE_VCORNER_SVS2;
+    // A cold, active inference gets a burst floor. Scope destruction still removes
+    // the entire request when work ends; warming immediately restores a DCVS range.
+    config.busVoltageCornerMin = config.coreVoltageCornerMin =
+        thermal == 0 ? DCVS_VOLTAGE_VCORNER_TURBO : DCVS_VOLTAGE_VCORNER_SVS2;
     config.busVoltageCornerTarget = config.coreVoltageCornerTarget = target;
     config.busVoltageCornerMax = config.coreVoltageCornerMax = maximum;
 
