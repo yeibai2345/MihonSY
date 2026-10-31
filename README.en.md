@@ -6,7 +6,7 @@
 
 **A manga reader based on [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY), focused on image enhancement, an enhanced webtoon experience and multi-device sync**
 
-Package `eu.kanade.mihonsy` ｜ Version 1.2.1 (11) ｜ Android 8.0+
+Package `eu.kanade.mihonsy` ｜ Version 1.3.0 (12) ｜ Android 8.0+
 
 [English](./README.en.md) | [中文](./README.md)
 
@@ -28,7 +28,7 @@ MihonSY is a fork of [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY). It
 
 ### 1. Image Enhancement
 
-- **AI upscaling (GPU)**: ncnn + Vulkan, with three built-in models — AnimeVideoMiniV18 / OmniMiniV2 (default) / OmniTurboV15 — at a fixed 2x.
+- **AI upscaling (GPU)**: ncnn + Vulkan, with three built-in models — AnimeVideoMiniV18 / OmniMiniV2 (default) / OmniTurboV15 — with **2x / 3x / 4x / 5x / 6x** output options and automatic scale reduction for large pages.
 - **AI upscaling (NPU)**: Qualcomm QNN / HTP hardware acceleration.
 - **Lanczos3 / Catmull-Rom**: classic interpolation with **1.5x / 2x / 2.5x / 3x** ratios (native separable convolution).
 - **Denoise**: an independent switch (off by default), decoupled from enhancement — it smooths luminance only and keeps hue.
@@ -76,7 +76,7 @@ MihonSY is a fork of [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY). It
 
 ## ⚠️ Notes
 
-- The built-in updater checks the `ruzhe85/MihonSY` Releases (at most once per 3 days, auto-skips pre-releases).
+- The built-in updater checks the `yeibai2345/MihonSY` Releases (at most once per 3 days, auto-skips pre-releases).
 - Multi-device sync: **only WebDAV** has the three real-time light channels for progress / history / bookmarks; Google Drive and SyncYomi only do full syncs.
 - Different package name from official TachiyomiSY, so they can coexist — but **keep their data separate** when backing up/restoring.
 - For personal learning and use only; respect manga copyright.
@@ -88,3 +88,6 @@ MihonSY is a fork of [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY). It
 - [TachiyomiSY (jobobby04)](https://github.com/jobobby04/TachiyomiSY)
 - [Mihon](https://github.com/mihonapp/mihon)
 - [mihon_img_upscale (HaoweiLi97)](https://github.com/HaoweiLi97/mihon_img_upscale)
+
+
+See [RELEASING.md](./RELEASING.md) for build and release instructions.

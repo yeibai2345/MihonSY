@@ -53,15 +53,18 @@ object Waifu2x {
          */
         @Volatile var retryLossMs = 0L
 
+        /** Queue and retry time accumulated across the passes of one requested AI scale. */
+        var previousPassWaitMs = 0L
+
         /** 需要从「总流程」里剔除的等锁总时长（两段之和 + 重试损失）；拿不到拆分的部分按 0 计。 */
         fun totalWaitMs(): Long {
-            if (waitMs < 0) return retryLossMs
+            if (waitMs < 0) return previousPassWaitMs + retryLossMs
             val secondWait = if (nativeInferenceMs > 0 && procMs > nativeInferenceMs) {
                 procMs - nativeInferenceMs
             } else {
                 0L
             }
-            return waitMs + secondWait + retryLossMs
+            return previousPassWaitMs + waitMs + secondWait + retryLossMs
         }
     }
 

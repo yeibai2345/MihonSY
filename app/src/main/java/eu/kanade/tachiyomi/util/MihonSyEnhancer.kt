@@ -5,6 +5,7 @@ import android.app.Application
 import android.graphics.Bitmap
 import android.os.SystemClock
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+import eu.kanade.tachiyomi.util.waifu2x.AiUpscalePlan
 import eu.kanade.tachiyomi.util.waifu2x.UpscaleModelRegistry
 import eu.kanade.tachiyomi.util.waifu2x.UpscaleModelSpec
 import eu.kanade.tachiyomi.util.waifu2x.Waifu2x
@@ -44,13 +45,7 @@ object MihonSyEnhancer {
      * 而它们比本就已经在跑的 800×9856（31.5MP）大不了多少。36MP 单张 +16MB（144MB），
      * 位图像素走 native 堆、不进 Java 堆上限，8GB 机型余量充足（8MP 输入门 = 800 宽下高 ≤11250）。
      */
-    private const val MAX_ENHANCE_OUTPUT_PIXELS = 36_000_000L
-
-    /**
-     * 倍率。AI 档（mode 5）由模型固定为 2x；CPU 档（2/3）用 [ReaderPreferences.lanczosScale]。
-     * 只用于 [exceedsOutputCap] 的预判，实际缩放仍由各自分支决定。
-     */
-    private const val AI_UPSCALE_FACTOR = 2f
+    private const val MAX_ENHANCE_OUTPUT_PIXELS = AiUpscalePlan.MAX_OUTPUT_PIXELS
 
     /**
      * Komiho: AI 面积回缩触发门。AI 2x 结果相对显示区的缩比 ≥ 此值时不动它 —— 轻度缩小
@@ -91,6 +86,7 @@ object MihonSyEnhancer {
     // private external fun nativeProcessAnime4K(bitmap: Bitmap): Bitmap
     private external fun nativeLanczosProcess(bitmap: Bitmap, scale: Float): Bitmap
     private external fun nativeResample(bitmap: Bitmap, scale: Float, kernel: Int): Bitmap
+    private external fun nativeResampleTo(bitmap: Bitmap, dstWidth: Int, dstHeight: Int): Bitmap
 
     /**
      * Komiho: AI 2x 回缩到显式目标尺寸（native kernel id 5 高斯，σ = 0.5×[strength]，
@@ -184,14 +180,13 @@ object MihonSyEnhancer {
             val startMillis = SystemClock.uptimeMillis()
             val ticker = object : Runnable {
                 override fun run() {
-                    handler.post { onProgress(SystemClock.uptimeMillis() - startMillis) }
+                    onProgress(SystemClock.uptimeMillis() - startMillis)
                     handler.postDelayed(this, 500)
                 }
             }
             handler.postDelayed(ticker, 500)
             try {
                 val result = block()
-                handler.removeCallbacks(ticker)
                 if (result != null) {
                     handler.post { onResult(result) }
                 } else {
@@ -200,9 +195,13 @@ object MihonSyEnhancer {
                     handler.post { onError(NoEnhancementException()) }
                 }
             } catch (e: Exception) {
-                handler.removeCallbacks(ticker)
                 logcat(LogPriority.WARN, e) { "Enhancement failed" }
                 handler.post { onError(e) }
+            } catch (e: OutOfMemoryError) {
+                logcat(LogPriority.WARN, e) { "Insufficient memory for enhancement" }
+                handler.post { onError(IllegalStateException("Insufficient memory for enhancement", e)) }
+            } finally {
+                handler.removeCallbacks(ticker)
             }
         }
     }
@@ -358,7 +357,7 @@ object MihonSyEnhancer {
                 }
             }
 
-            // Komiho: GPU AI upscale (ncnn + Vulkan). Scale is fixed by the model (2x).
+            // GPU / NPU AI upscale, with bounded passes up to the requested scale.
             5 -> {
                 enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex)
             }
@@ -458,9 +457,9 @@ object MihonSyEnhancer {
         }
     }
 
-    /** 当前档位实际会用到的放大倍率（AI 档固定见 [AI_UPSCALE_FACTOR]，CPU 档取偏好）。 */
+    /** Requested scale; AI passes may use a lower scale for large pages. */
     private fun scaleFor(mode: Int, preferences: ReaderPreferences): Float =
-        if (mode == 5) AI_UPSCALE_FACTOR else preferences.lanczosScale.get() / 100f
+        if (mode == 5) AiUpscalePlan.normalizeScale(preferences.aiScale.get()).toFloat() else preferences.lanczosScale.get() / 100f
 
     /**
      * [input] 经当前档位放大后，像素总量是否会超过 [MAX_ENHANCE_OUTPUT_PIXELS]。
@@ -469,6 +468,9 @@ object MihonSyEnhancer {
      * 一次非整数重采样。调用方据此整页跳过（见 [enhance]）。
      */
     private fun exceedsOutputCap(input: Bitmap, mode: Int, preferences: ReaderPreferences): Boolean {
+        if (mode == 5) {
+            return AiUpscalePlan.create(input.width, input.height, preferences.aiScale.get(), resolveAiModel(preferences).scale) == null
+        }
         val scale = scaleFor(mode, preferences)
         if (scale <= 1f) return false
         val output = input.width.toDouble() * input.height.toDouble() * scale * scale
@@ -550,15 +552,65 @@ object MihonSyEnhancer {
     private fun needsGrayMask(preferences: ReaderPreferences): Boolean =
         resolveAiModel(preferences).backend == UpscaleModelSpec.Backend.QNN_HTP
 
-    /**
-     * Komiho: GPU AI upscale branch — used when [ReaderPreferences.enhancementMode] is 5.
-     *
-     * The bundled ncnn model is a fixed 2x network, so [ReaderPreferences.lanczosScale] does
-     * not choose the AI output size. When this ABI has no Vulkan build (or inference fails)
-     * we fall back to the CPU Lanczos3 resampler at the configured scale, so the page is
-     * still enlarged instead of silently staying at its original size.
-     */
+    /** Chains AI passes and releases intermediate bitmaps as soon as they are consumed. */
     private fun enhanceWithGpu(
+        input: Bitmap,
+        preferences: ReaderPreferences,
+        sourceTag: String = "",
+        timing: Waifu2x.Timing? = null,
+        pageIndex: Int = -1,
+    ): Bitmap? {
+        val plan = AiUpscalePlan.create(
+            input.width,
+            input.height,
+            preferences.aiScale.get(),
+            resolveAiModel(preferences).scale,
+        ) ?: return null
+        var current = input
+        try {
+            current = ensureArgb(input) ?: return null
+            for (pass in plan.passes) {
+                if (Thread.currentThread().isInterrupted) {
+                    EnhanceTimings.markInterrupted(pageIndex)
+                    return null
+                }
+                if (current.width != pass.input.width || current.height != pass.input.height) {
+                    val resized = nativeResampleTo(current, pass.input.width, pass.input.height)
+                    if (resized === current) return null
+                    if (current !== input) current.recycle()
+                    current = resized
+                }
+                val passTiming = Waifu2x.Timing()
+                val upscaled = try {
+                    enhanceAiPass(current, preferences, sourceTag, passTiming, pageIndex)
+                } finally {
+                    timing?.let { it.previousPassWaitMs += passTiming.totalWaitMs() }
+                } ?: return null
+                if (current !== input) current.recycle()
+                current = upscaled
+                // Discard output from a model changed while this plan was running.
+                if (current.width != pass.output.width || current.height != pass.output.height) return null
+            }
+            if (current.width != plan.output.width || current.height != plan.output.height) {
+                val resized = nativeResampleTo(current, plan.output.width, plan.output.height)
+                if (resized === current) return null
+                if (current !== input) current.recycle()
+                current = resized
+            }
+            val result = current
+            current = input // Transfer ownership of the final bitmap to the caller.
+            return result
+        } catch (e: OutOfMemoryError) {
+            logcat(LogPriority.WARN, e) { "AI upscale ran out of memory; keeping original" }
+            EnhanceTimings.markSkipped(pageIndex)
+            return null
+        } finally {
+            if (current !== input && !current.isRecycled) current.recycle()
+        }
+    }
+
+    /** One native model pass. An interrupted visible page retains its bounded retry policy. */
+    private fun enhanceAiPass(
         input: Bitmap,
         preferences: ReaderPreferences,
         sourceTag: String = "",
@@ -774,7 +826,7 @@ object MihonSyEnhancer {
         if (grayCount == 0) {
             // 整页彩色：钳位无效果，掩膜也不必建。
             if (argb !== src) {
-                src.recycle()
+                argb.recycle()
             }
             return src to null
         }

@@ -179,6 +179,8 @@ class PagerConfig(
             .register({ }, { imagePropertyChangedListener?.invoke() })
         readerPreferences.lanczosScale
             .register({ }, { imagePropertyChangedListener?.invoke() })
+        readerPreferences.aiScale
+            .register({ }, { imagePropertyChangedListener?.invoke() })
         readerPreferences.aiModelId
             .register({ }, { imagePropertyChangedListener?.invoke() })
         readerPreferences.aiTileSize

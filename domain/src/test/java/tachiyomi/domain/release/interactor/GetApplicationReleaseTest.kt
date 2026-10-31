@@ -31,6 +31,24 @@ class GetApplicationReleaseTest {
     }
 
     @Test
+    fun `Version comparison rejects downgrades and malformed tags`() {
+        listOf(
+            Triple("2.0.0", "v1.9.9", false),
+            Triple("1.3.0", "v1.2.99", false),
+            Triple("1.2.9", "v1.3.0", true),
+            Triple("1.3.0", "v1.3", false),
+            Triple("1.3", "v1.3.1", true),
+            Triple("1.3.0-12", "v1.3.0", false),
+            Triple("1.3.0", "ci", false),
+            Triple("1.3.0", "v9999999999999999999999.0", false),
+        ).forEach { (current, next, expected) ->
+            getApplicationRelease.isNewVersion(false, "0", current, next) shouldBe expected
+        }
+        getApplicationRelease.isNewVersion(true, "100", "", "v1.3.0") shouldBe false
+        getApplicationRelease.isNewVersion(true, "100", "", "r101") shouldBe true
+    }
+
+    @Test
     fun `When has update but is preview expect new update`() = runTest {
         every { preference.get() } returns 0
         every { preference.set(any()) }.answers { }

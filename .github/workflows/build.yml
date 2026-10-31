@@ -1,18 +1,24 @@
 name: Build MihonSY APK
 
-"on":
+on:
   push:
     branches: [master]
   workflow_dispatch:
     inputs:
       mode:
-        description: "发布模式: ci = 测试版(默认, 固定 tag ci), formal = 正式版 (vX.Y.Z)"
-        required: false
-        default: ci
+        description: "ci = test APK; unsigned = release for local signing; formal = signed GitHub release"
         type: choice
-        options:
-          - ci
-          - formal
+        options: [ci, unsigned, formal]
+        default: ci
+  workflow_call:
+    inputs:
+      mode:
+        type: string
+        default: ci
+
+concurrency:
+  group: mihonsy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -20,213 +26,95 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
-      # MihonSY: cache Gradle dependencies — the dependency download is the bulk
-      # of the 12-18 min build; caching cuts rebuilds to roughly half.
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', '**/gradle.properties') }}
-          restore-keys: |
-            gradle-
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          # 该 action 的默认 packages 是 "tools platform-tools"，但 "tools" 包已被
-          # Google 从 sdkmanager 仓库移除（新版 cmdline-tools 找不到它会直接退出码 1）。
-          # 显式覆盖，只保留 platform-tools。
-          packages: platform-tools
-
-      - name: Install SDK components (platform 36 + build-tools + NDK + CMake)
-        run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
-
-      - name: Write local.properties
-        run: |
-          echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
-          cat local.properties
-
-      - name: Decode signing keystore from secrets
-        run: |
-          mkdir -p keystore
-          echo "${{ secrets.MIHONSY_KEYSTORE_BASE64 }}" | base64 -d > keystore/mihonmod.jks
-          ls -la keystore/
-
-      - name: Grant gradlew execute permission
-        run: chmod +x gradlew
-
-      # MihonSY: resolve publish mode —— 必须在构建之前定，因为两种模式的 ABI 集合不同
-      # （ci 只要 arm64，正式版要 arm64 + 合并包）。
-      # - push: HEAD commit message containing "[release]" (or 正式版) → formal,
-      #   everything else → ci (test build, fixed tag "ci").
-      # - workflow_dispatch: use the "mode" input.
-      # Both modes sign with the SAME keystore (mihonmod.jks decoded above), so a
-      # CI build and a formal build can overwrite each other on a device.
-      - name: Resolve publish mode
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Resolve build mode
         id: mode
+        env:
+          REQUESTED_MODE: ${{ inputs.mode }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${{ github.event.inputs.mode }}"
-          else
-            MSG=$(git log -1 --format=%s)
-            if echo "$MSG" | grep -qiE '\[release\]|正式版'; then
-              MODE=formal
-            else
-              MODE=ci
-            fi
+          MODE="${REQUESTED_MODE:-ci}"
+          if [ -z "$REQUESTED_MODE" ] && git log -1 --format=%s | grep -qiE '\[release\]|正式版'; then
+            MODE=formal
           fi
-          echo "mode=$MODE"
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-
-      - name: Build release APK
+          echo "value=$MODE" >> "$GITHUB_OUTPUT"
+      - name: Prepare release signing
+        if: steps.mode.outputs.value == 'formal'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.MIHONSY_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.MIHONSY_KEYSTORE_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo "::error::Configure MIHONSY_KEYSTORE_BASE64 before releasing."; exit 1; }
+          test -n "$STORE_PASSWORD" || { echo "::error::Configure MIHONSY_KEYSTORE_PASSWORD before releasing."; exit 1; }
+          mkdir -p keystore
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > keystore/mihonmod.jks
+          test -s keystore/mihonmod.jks
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - name: Install Android build components
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+      - name: Run regression tests
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest :domain:test --no-daemon --stacktrace
+      - name: Build test APK
+        if: steps.mode.outputs.value == 'ci'
+        run: ./gradlew :app:assembleDebug -PmihonsyAbi=arm64-v8a --no-daemon --stacktrace
+      - name: Build unsigned release for local signing
+        if: steps.mode.outputs.value == 'unsigned'
+        run: ./gradlew :app:assembleRelease -Pdisable-code-shrink -PmihonsyUnsigned=true -PmihonsyAbi=arm64-v8a -PmihonsyUniversal=true --no-daemon --stacktrace
+      - name: Build signed release APK
+        if: steps.mode.outputs.value == 'formal'
         env:
           MIHONSY_STORE_PASSWORD: ${{ secrets.MIHONSY_KEYSTORE_PASSWORD }}
-          MIHONSY_KEY_PASSWORD: ${{ secrets.MIHONSY_KEYSTORE_PASSWORD }}
+          MIHONSY_KEY_PASSWORD: ${{ secrets.MIHONSY_KEY_PASSWORD || secrets.MIHONSY_KEYSTORE_PASSWORD }}
+          MIHONSY_KEY_ALIAS: ${{ secrets.MIHONSY_KEY_ALIAS }}
+        run: ./gradlew :app:assembleRelease -Pdisable-code-shrink -PmihonsyAbi=arm64-v8a -PmihonsyUniversal=true --no-daemon --stacktrace
+      - name: Prepare verified release assets
+        if: steps.mode.outputs.value == 'formal'
+        id: release
         run: |
-          # MihonSY: ABI 按发布模式收敛 —— AI 引擎（ncnn/Vulkan + QNN/HTP）只有 arm64 实现，
-          # 见 app/build.gradle.kts 的 splits 块。
-          #   ci     → 只出 arm64 单包（构建 + 上传都最快）
-          #   formal → arm64 + 合并包，供不挑 ABI 的用户直接装
-          EXTRA=""
-          if [ "${{ steps.mode.outputs.mode }}" = "formal" ]; then
-            EXTRA="-PmihonsyUniversal=true"
+          VERSION=$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts | head -1)
+          test -n "$VERSION"
+          TAG="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "::error::Tag $TAG already exists. Bump versionName before publishing."
+            exit 1
           fi
-          echo "ABI flags: -PmihonsyAbi=arm64-v8a $EXTRA"
-          ./gradlew assembleRelease -Pdisable-code-shrink -PmihonsyAbi=arm64-v8a $EXTRA --no-daemon --stacktrace
-
-      - name: Verify APK signature
-        run: |
-          ls -la app/build/outputs/apk/release/
-          $ANDROID_HOME/build-tools/36.0.0/apksigner verify --print-certs app/build/outputs/apk/release/app-arm64-v8a-release.apk | head -5
-
-      - name: Upload APKs (artifact)
-        uses: actions/upload-artifact@v4
+          mkdir -p release-assets
+          for APK in app/build/outputs/apk/release/*.apk; do
+            "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify "$APK"
+            ABI=$(basename "$APK" | sed -E 's/^app-(.+)-release\.apk$/\1/')
+            cp "$APK" "release-assets/mihonsy-$VERSION-$ABI.apk"
+          done
+          (cd release-assets && sha256sum *.apk > SHA256SUMS.txt)
+          python3 .github/scripts/release_notes.py "$VERSION" > release-assets/RELEASE_NOTES.md
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
         with:
-          name: mihonsy-apk
+          name: mihonsy-${{ github.sha }}
           path: |
+            app/build/outputs/apk/debug/*.apk
             app/build/outputs/apk/release/*.apk
+            release-assets/*
           retention-days: 30
-
-      # MihonSY CI release: fixed tag "ci", always marked prerelease so it never
-      # becomes the GitHub Latest release. APKs are named mihonsy-ci-{abi}.apk.
-      - name: Publish CI release (test build)
-        if: steps.mode.outputs.mode == 'ci'
+          if-no-files-found: error
+      - name: Publish GitHub release
+        if: steps.mode.outputs.value == 'formal'
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          set -e
-
-          APK_DIR=app/build/outputs/apk/release
-          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
-          SHA=$(git rev-parse --short HEAD)
-
-          cd "$APK_DIR"
-          for apk in *.apk; do
-            abi=$(echo "$apk" | sed -E 's/^app-(.+)-release\.apk$/\1/')
-            [ "$abi" = "$apk" ] && abi=universal
-            mv "$apk" "mihonsy-ci-${abi}.apk"
-          done
-          ls -la
-
-          # Delete any existing CI release/tag so rebuilds republish in place.
-          cd "$GITHUB_WORKSPACE"
-          gh release delete ci --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
-          git tag -d ci 2>/dev/null || true
-          git push origin ":refs/tags/ci" 2>/dev/null || true
-
-          gh release create ci \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "MihonSY CI Build" \
-            --prerelease \
-            --notes "CI build (${VERSION_NAME}) from commit \`${SHA}\` — 测试版, 非正式发布.
-
-            Signature: same keystore as formal releases (mihonmod.jks)." \
-            "${APK_DIR}"/mihonsy-ci-*.apk
-
-          echo "Published CI release (tag ci)"
-
-      # MihonSY formal release: versioned tag v{x.y.z} + changelog body,
-      # becomes the GitHub Latest release.
-      - name: Publish formal release
-        if: steps.mode.outputs.mode == 'formal'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -e
-
-          APK_DIR=app/build/outputs/apk/release
-          VERSION_CODE=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)
-          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
-
-          echo "versionName=$VERSION_NAME versionCode=$VERSION_CODE"
-
-          # Rename APKs to mihonsy-{x.y.z}-{abi}.apk (full version name).
-          cd "$APK_DIR"
-          for apk in *.apk; do
-            abi=$(echo "$apk" | sed -E 's/^app-(.+)-release\.apk$/\1/')
-            [ "$abi" = "$apk" ] && abi=universal
-            mv "$apk" "mihonsy-${VERSION_NAME}-${abi}.apk"
-          done
-          ls -la
-
-          TAG="v${VERSION_NAME}"
-
-          # Delete any existing release/tag with the same name so rebuilds can republish.
-          cd "$GITHUB_WORKSPACE"
-          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
-          git tag -d "$TAG" 2>/dev/null || true
-          git push origin ":refs/tags/$TAG" 2>/dev/null || true
-
-          # Extract the version's section from a changelog file.
-          extract_section() {
-            awk -v ver="v${VERSION_NAME}" '
-              /^## / {
-                if (section) exit
-                if (index($0, ver) > 0) { section=1; next }
-              }
-              section { print }
-            ' "$1"
-          }
-
-          NOTES_FILE=$(mktemp)
-          {
-            echo "## 中文 / Chinese"
-            echo ""
-            extract_section CHANGELOG.md || true
-            echo ""
-            echo "---"
-            echo ""
-            echo "## English"
-            echo ""
-            extract_section CHANGELOG.en.md || true
-          } > "$NOTES_FILE"
-
-          # Fallback if neither section matched.
-          if ! grep -qE '^## ' "$NOTES_FILE"; then
-            {
-              echo "MihonSY ${VERSION_NAME}"
-              echo ""
-              echo "Built automatically from the master branch."
-            } > "$NOTES_FILE"
-          fi
-
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "MihonSY ${VERSION_NAME}" \
-            --notes-file "$NOTES_FILE" \
-            "${APK_DIR}/mihonsy-${VERSION_NAME}-"*.apk
-
-          echo "Published release $TAG"
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "MihonSY $RELEASE_VERSION" --latest \
+            --notes-file release-assets/RELEASE_NOTES.md \
+            release-assets/*.apk release-assets/SHA256SUMS.txt

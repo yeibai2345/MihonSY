@@ -6,7 +6,7 @@
 
 **基于 TachiyomiSY 的漫画阅读器，主打图像增强、条漫阅读增强与多设备同步**
 
-包名 `eu.kanade.mihonsy` ｜ 版本 1.2.1 (11) ｜ Android 8.0+
+包名 `eu.kanade.mihonsy` ｜ 版本 1.3.0 (12) ｜ Android 8.0+
 
 [中文](./README.md) | [English](./README.en.md)
 
@@ -29,7 +29,7 @@ MihonSY 是 [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY) 的一个分
 
 ### 1. 图像增强
 
-- **AI 超分（GPU）**：ncnn + Vulkan，内置 AnimeVideoMiniV18 / OmniMiniV2（默认）/ OmniTurboV15 三个模型，固定 2x。
+- **AI 超分（GPU）**：ncnn + Vulkan，内置 AnimeVideoMiniV18 / OmniMiniV2（默认）/ OmniTurboV15 三个模型，支持 **2x / 3x / 4x / 5x / 6x**，大图自动降低倍率以控制内存。
 - **AI 超分（NPU）**：Qualcomm QNN / HTP 硬件加速。
 - **Lanczos3 / Catmull-Rom**：经典插值，支持 **1.5x / 2x / 2.5x / 3x** 四档倍率（native 分离卷积实现）。
 - **降噪**：与增强解耦的独立开关（默认关），只平滑亮度、保持色相。
@@ -81,7 +81,7 @@ MihonSY 是 [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY) 的一个分
 
 ## ⚠️ 注意事项
 
-- 内置更新检查会访问 `ruzhe85/MihonSY` 的 Releases（最多每 3 天一次，自动忽略 pre-release）。
+- 内置更新检查会访问 `yeibai2345/MihonSY` 的 Releases（最多每 3 天一次，自动忽略 pre-release）。
 - 多设备同步：**只有 WebDAV** 带进度 / 历史 / 书签三条实时小通道；Google Drive 与 SyncYomi 仅做全量同步。
 - 与官方 TachiyomiSY 包名不同，可共存，但**备份/恢复时注意区分数据**。
 - 仅个人学习使用，请遵守所读漫画的版权。
@@ -93,3 +93,6 @@ MihonSY 是 [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY) 的一个分
 - [TachiyomiSY (jobobby04)](https://github.com/jobobby04/TachiyomiSY)
 - [Mihon](https://github.com/mihonapp/mihon)
 - [mihon_img_upscale (HaoweiLi97)](https://github.com/HaoweiLi97/mihon_img_upscale) 
+
+
+构建与发布说明见 [RELEASING.md](./RELEASING.md)。
