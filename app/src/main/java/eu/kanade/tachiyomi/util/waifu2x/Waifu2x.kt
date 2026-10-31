@@ -238,7 +238,7 @@ object Waifu2x {
      * Never evicted: the key space is the current chapter's page count, so it stays tiny and
      * is simply overwritten when another chapter is opened.
      */
-    private val engineByPage = java.util.concurrent.ConcurrentHashMap<Int, EngineKind>()
+    private val engineByPage = android.util.LruCache<Int, EngineKind>(256)
 
     /**
      * Komiho: engine that produced the image for [pageIndex].
@@ -356,7 +356,7 @@ object Waifu2x {
                 if (kind != null) {
                     lastEngine = kind
                     if (id >= 0) {
-                        engineByPage[id] = kind
+                        engineByPage.put(id, kind)
                     }
                 }
             }

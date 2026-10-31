@@ -20,6 +20,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Draws completed AI bands over the original, without changing the scroll geometry. */
 internal class WebtoonStripEnhancer(
@@ -111,12 +112,17 @@ internal class WebtoonStripEnhancer(
         lastAttempt[index] = now
         val displayWidth = view.width
         work = scope.launch(Dispatchers.IO) {
-            val result = enhance(index, displayWidth)
+            val abandoned = AtomicBoolean(false)
+            val result = enhance(index, displayWidth, abandoned)
             // Always reclaim an abandoned result, even if the view was recycled
             // while native inference was completing on this worker.
             withContext(NonCancellable + Dispatchers.Main.immediate) {
                 activeBand = null
                 work = null
+                if (abandoned.get()) {
+                    attempts.remove(index)
+                    lastAttempt.remove(index)
+                }
                 if (closed || index !in wanted) {
                     result?.bitmap?.recycle()
                     // Leaving the viewport is not an inference failure. Allow a later revisit.
@@ -137,12 +143,14 @@ internal class WebtoonStripEnhancer(
         }
     }
 
-    private fun enhance(index: Int, displayWidth: Int): WebtoonImageCache.Entry? {
+    private fun enhance(index: Int, displayWidth: Int, abandoned: AtomicBoolean): WebtoonImageCache.Entry? {
         val band = plan.band(index)
         var input: Bitmap? = null
         var output: Bitmap? = null
         val cancelled = {
-            closed || index !in wanted || preferences.enhancementCacheKey() != fingerprint
+            (closed || index !in wanted || preferences.enhancementCacheKey() != fingerprint).also {
+                if (it) abandoned.set(true)
+            }
         }
         try {
             if (cancelled() || source.isRecycled) return null
@@ -157,7 +165,7 @@ internal class WebtoonStripEnhancer(
                 canvas.drawBitmap(source, Rect(0, sourceRow, plan.width, sourceRow + 1),
                     Rect(0, row, plan.width, row + 1), null)
             }
-            val bitmap = input ?: return null
+            val bitmap = input
             val start = SystemClock.uptimeMillis()
             var waiting = 0L
             output = MihonSyEnhancer.enhance(

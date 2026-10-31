@@ -362,10 +362,10 @@ class WebtoonViewer(
         cancelPrewarmWatchdog()
         crossChapterPrewarm.cancel("viewer-destroy")
         syncUrgentPage()
-        Waifu2x.updateWebtoonPriorities(emptySet(), emptyList())
-        Waifu2x.visiblePageIndex = -1
         // Detaching the adapter recycles attached and cached holders, cancelling their work.
         recycler.adapter = null
+        Waifu2x.updateWebtoonPriorities(emptySet(), emptyList())
+        Waifu2x.visiblePageIndex = -1
         WebtoonImageCache.clear()
         super.destroy()
         scope.cancel()

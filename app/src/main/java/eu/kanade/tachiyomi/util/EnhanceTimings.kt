@@ -52,6 +52,8 @@ object EnhanceTimings {
     /** [pageIndex] 为 -1（未标注页号的请求）时忽略。 */
     fun put(pageIndex: Int, pureMillis: Long) {
         if (pageIndex >= 0 && pureMillis >= 0) {
+            // Disposed Coil targets may never consume their final timing. Keep this bounded.
+            if (map.size >= MAX_PENDING) map.clear()
             map[pageIndex] = pureMillis
             // Komiho (2026-10-16): 这一页这次真增强成功了 ⇒ 之前那次「被抢占」的登记已过期，
             // 顺手作废 —— 否则停顿补算会为一张已经增强好的图再跑一次 NPU。
