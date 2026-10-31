@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.data.coil
 
+import android.graphics.Bitmap
+import eu.kanade.tachiyomi.util.waifu2x.StripUpscalePlan
 import coil3.Extras
 import coil3.getExtra
 import coil3.request.ImageRequest
@@ -96,3 +98,27 @@ val Options.originalSizeDisplay: Boolean
     get() = getExtra(originalSizeDisplayKey)
 
 private val originalSizeDisplayKey = Extras.Key(default = false)
+
+data class EnhancementPreview(val bitmap: Bitmap, val sourceWidth: Int, val sourceHeight: Int)
+
+fun ImageRequest.Builder.enhancementPreview(callback: ((EnhancementPreview) -> Unit)?) = apply {
+    extras[enhancementPreviewKey] = callback
+}
+
+val Options.enhancementPreview: ((EnhancementPreview) -> Unit)?
+    get() = getExtra(enhancementPreviewKey)
+
+private val enhancementPreviewKey = Extras.Key<((EnhancementPreview) -> Unit)?>(default = null)
+
+class StripEnhancementRequest {
+    @Volatile var plan: StripUpscalePlan? = null
+}
+
+fun ImageRequest.Builder.stripEnhancement(request: StripEnhancementRequest?) = apply {
+    extras[stripEnhancementKey] = request
+}
+
+val Options.stripEnhancement: StripEnhancementRequest?
+    get() = getExtra(stripEnhancementKey)
+
+private val stripEnhancementKey = Extras.Key<StripEnhancementRequest?>(default = null)

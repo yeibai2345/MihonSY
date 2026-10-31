@@ -172,6 +172,7 @@ class WebtoonViewer(
      * Adapter of the recycler view.
      */
     private val adapter = WebtoonAdapter(this)
+    private var enhancementScrollDirection = 1
 
     /**
      * Currently active item. It can be a chapter page or a chapter transition.
@@ -203,6 +204,7 @@ class WebtoonViewer(
                 }
 
                 override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                    if (dy != 0) enhancementScrollDirection = if (dy > 0) 1 else -1
                     onScrolled()
 
                     if ((dy > threshold || dy < -threshold) && activity.viewModel.state.value.menuVisible) {
@@ -360,6 +362,9 @@ class WebtoonViewer(
         cancelPrewarmWatchdog()
         crossChapterPrewarm.cancel("viewer-destroy")
         syncUrgentPage()
+        Waifu2x.updateWebtoonPriorities(emptySet(), emptyList())
+        Waifu2x.visiblePageIndex = -1
+        WebtoonImageCache.clear()
         super.destroy()
         scope.cancel()
     }
@@ -394,7 +399,7 @@ class WebtoonViewer(
         val prewarm = crossChapterPrewarm
         val target = prewarm.activeTarget
         Waifu2x.urgentPageIndex =
-            if (prewarm.isOpen && target != null && !prewarm.isTargetRendered) target.index else -1
+            if (prewarm.isOpen && target != null && !prewarm.isTargetRendered) target.enhancementId else -1
     }
 
     /**
@@ -416,12 +421,12 @@ class WebtoonViewer(
             for (position in first..last) {
                 val view = layoutManager.findViewByPosition(position) ?: continue
                 if (view.top <= centerY && view.bottom >= centerY) {
-                    (adapter.items.getOrNull(position) as? ReaderPage)?.let { return it.index }
+                    (adapter.items.getOrNull(position) as? ReaderPage)?.let { return it.enhancementId }
                     break
                 }
             }
         }
-        return (currentPage as? ReaderPage)?.index ?: Waifu2x.visiblePageIndex
+        return (currentPage as? ReaderPage)?.enhancementId ?: Waifu2x.visiblePageIndex
     }
 
     /**
@@ -519,6 +524,19 @@ class WebtoonViewer(
         // （见 Waifu2x.visiblePageIndex 的说明），条漫一直是 -1 ⇒ 闸门对条漫完全失效；
         // 跨章预载会额外多布几屏页，登记之后预取才会给正在看的那一页让路。
         Waifu2x.visiblePageIndex = visiblePageIndexForGate()
+        val first = layoutManager.findFirstVisibleItemPosition()
+        val last = layoutManager.findLastVisibleItemPosition()
+        if (first >= 0 && last >= first) {
+            val visible = (first..last).mapNotNull { (adapter.items.getOrNull(it) as? ReaderPage)?.enhancementId }.toSet()
+            val edge = if (enhancementScrollDirection > 0) last else first
+            val upcoming = (1..3).mapNotNull {
+                (adapter.items.getOrNull(edge + it * enhancementScrollDirection) as? ReaderPage)?.enhancementId
+            }
+            Waifu2x.updateWebtoonPriorities(visible, upcoming)
+        }
+        for (childIndex in 0 until recycler.childCount) {
+            (recycler.getChildViewHolder(recycler.getChildAt(childIndex)) as? WebtoonPageHolder)?.onViewportChanged()
+        }
 
         // Komiho: 跨章预载窗口复核（幂等）。放在最后 —— 此时 currentPage 才是最新的。
         recheckCrossChapterPrewarm()

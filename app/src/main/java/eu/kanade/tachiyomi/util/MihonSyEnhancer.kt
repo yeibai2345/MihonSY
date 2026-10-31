@@ -58,7 +58,6 @@ object MihonSyEnhancer {
      * Komiho: 灰度掩膜的通道发散度阈值（/255）。≤ 此值视为灰度像素（容忍 JPEG 色噪
      * ±2-3）；> 此值视为彩色像素，原样通过模型并保留输出色度。
      */
-    private const val GRAY_CHROMA_THRESHOLD = 8
 
     init {
         System.loadLibrary("mihonsy-enhance")
@@ -87,6 +86,8 @@ object MihonSyEnhancer {
     private external fun nativeLanczosProcess(bitmap: Bitmap, scale: Float): Bitmap
     private external fun nativeResample(bitmap: Bitmap, scale: Float, kernel: Int): Bitmap
     private external fun nativeResampleTo(bitmap: Bitmap, dstWidth: Int, dstHeight: Int): Bitmap
+    private external fun nativeClampGray(bitmap: Bitmap): ByteArray?
+    private external fun nativeNeutralizeChroma(bitmap: Bitmap, mask: ByteArray, srcWidth: Int)
 
     /**
      * Komiho: AI 2x 回缩到显式目标尺寸（native kernel id 5 高斯，σ = 0.5×[strength]，
@@ -228,8 +229,11 @@ object MihonSyEnhancer {
         onComplete: ((enhanced: Boolean, elapsedMillis: Long, gpuWaitMillis: Long) -> Unit)? = null,
         sourceTag: String = "",
         pageIndex: Int = -1,
+        shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
+        priorityOffset: () -> Int = { 0 },
     ): Bitmap? {
         val start = SystemClock.uptimeMillis()
+        if (shouldCancel()) return null
         if (input.isRecycled) {
             // Komiho: 什么都没做 —— 角标记成 skip，别落回 engineLabel 的默认值 CPU OK。
             EnhanceTimings.markSkipped(pageIndex)
@@ -359,7 +363,7 @@ object MihonSyEnhancer {
 
             // GPU / NPU AI upscale, with bounded passes up to the requested scale.
             5 -> {
-                enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex)
+                enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex, shouldCancel, priorityOffset)
             }
 
             else -> null
@@ -559,6 +563,8 @@ object MihonSyEnhancer {
         sourceTag: String = "",
         timing: Waifu2x.Timing? = null,
         pageIndex: Int = -1,
+        shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
+        priorityOffset: () -> Int = { 0 },
     ): Bitmap? {
         val plan = AiUpscalePlan.create(
             input.width,
@@ -568,9 +574,10 @@ object MihonSyEnhancer {
         ) ?: return null
         var current = input
         try {
-            current = ensureArgb(input) ?: return null
+            // JNI only reads input pixels. Immutable ARGB images need no copy.
+            current = if (input.config == Bitmap.Config.ARGB_8888) input else ensureArgb(input) ?: return null
             for (pass in plan.passes) {
-                if (Thread.currentThread().isInterrupted) {
+                if (shouldCancel()) {
                     EnhanceTimings.markInterrupted(pageIndex)
                     return null
                 }
@@ -582,7 +589,7 @@ object MihonSyEnhancer {
                 }
                 val passTiming = Waifu2x.Timing()
                 val upscaled = try {
-                    enhanceAiPass(current, preferences, sourceTag, passTiming, pageIndex)
+                    enhanceAiPass(current, preferences, sourceTag, passTiming, pageIndex, shouldCancel, priorityOffset)
                 } finally {
                     timing?.let { it.previousPassWaitMs += passTiming.totalWaitMs() }
                 } ?: return null
@@ -616,6 +623,8 @@ object MihonSyEnhancer {
         sourceTag: String = "",
         timing: Waifu2x.Timing? = null,
         pageIndex: Int = -1,
+        shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
+        priorityOffset: () -> Int = { 0 },
     ): Bitmap? {
         if (Waifu2x.isSupported) {
             // Komiho: model and tile geometry are user preferences. Both are pushed before
@@ -642,6 +651,7 @@ object MihonSyEnhancer {
             var retry = 0
             val retryDeadline = SystemClock.uptimeMillis() + VISIBLE_RETRY_WINDOW_MS
             while (true) {
+                if (shouldCancel()) return null
                 val attemptStart = SystemClock.uptimeMillis()
                 Waifu2x.process(
                     app,
@@ -649,6 +659,8 @@ object MihonSyEnhancer {
                     id = pageIndex,
                     tag = sourceTag,
                     timing = timing,
+                    shouldCancel = shouldCancel,
+                    priorityOffset = priorityOffset,
                 )?.let { upscaled ->
                     // Komiho (2026-09-30): AI 2x 结果默认直接交 SSIV 缩放显示（2026-09-26 定稿）。
                     // 可选开关 [ReaderPreferences.aiAreaDownscale] 开启后，由解码器按视图尺寸
@@ -800,41 +812,16 @@ object MihonSyEnhancer {
                 return src to null
             }
         }
-        val w = argb.width
-        val h = argb.height
-        val pixels = IntArray(w * h)
-        argb.getPixels(pixels, 0, w, 0, 0, w, h)
-        val mask = ByteArray(w * h)
-        var grayCount = 0
-        for (i in pixels.indices) {
-            val p = pixels[i]
-            val r = (p shr 16) and 0xFF
-            val g = (p shr 8) and 0xFF
-            val b = p and 0xFF
-            val divergence = maxOf(
-                kotlin.math.abs(r - g),
-                kotlin.math.abs(g - b),
-                kotlin.math.abs(r - b),
-            )
-            if (divergence <= GRAY_CHROMA_THRESHOLD) {
-                val y = (r * 299 + g * 587 + b * 114) / 1000
-                pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
-                mask[i] = 1
-                grayCount++
-            }
+        val mask = try {
+            nativeClampGray(argb)
+        } catch (e: OutOfMemoryError) {
+            null
         }
-        if (grayCount == 0) {
-            // 整页彩色：钳位无效果，掩膜也不必建。
-            if (argb !== src) {
-                argb.recycle()
-            }
+        if (mask == null) {
+            if (argb !== src) argb.recycle()
             return src to null
         }
-        argb.setPixels(pixels, 0, w, 0, 0, w, h)
-        logcat(LogPriority.DEBUG) {
-            "Gray mask: ${grayCount * 100 / (w * h)}% gray (${w}x$h)"
-        }
-        return argb to (mask to w)
+        return argb to (mask to argb.width)
     }
 
     /**
@@ -845,29 +832,8 @@ object MihonSyEnhancer {
         if (result.isRecycled || result.config != Bitmap.Config.ARGB_8888 || !result.isMutable) {
             return
         }
-        val scale = result.width / srcWidth
-        if (scale <= 0) return
         try {
-            val w = result.width
-            val h = result.height
-            val pixels = IntArray(w * h)
-            result.getPixels(pixels, 0, w, 0, 0, w, h)
-            for (y in 0 until h) {
-                val srcRow = (y / scale) * srcWidth
-                var idx = y * w
-                for (x in 0 until w) {
-                    if (mask[srcRow + x / scale].toInt() == 1) {
-                        val p = pixels[idx]
-                        val r = (p shr 16) and 0xFF
-                        val g = (p shr 8) and 0xFF
-                        val b = p and 0xFF
-                        val y8 = (r * 299 + g * 587 + b * 114) / 1000
-                        pixels[idx] = (p and 0xFF000000.toInt()) or (y8 shl 16) or (y8 shl 8) or y8
-                    }
-                    idx++
-                }
-            }
-            result.setPixels(pixels, 0, w, 0, 0, w, h)
+            nativeNeutralizeChroma(result, mask, srcWidth)
         } catch (t: Throwable) {
             logcat(LogPriority.WARN, t) { "Chroma neutralize failed; keeping output" }
         }

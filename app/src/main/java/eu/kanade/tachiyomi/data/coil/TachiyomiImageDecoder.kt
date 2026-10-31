@@ -17,6 +17,9 @@ import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.util.EnhanceTimings
 import eu.kanade.tachiyomi.util.MihonSyEnhancer
 import eu.kanade.tachiyomi.util.waifu2x.Waifu2x
+import eu.kanade.tachiyomi.util.waifu2x.StripUpscalePlan
+import eu.kanade.tachiyomi.util.waifu2x.AiUpscalePlan
+import eu.kanade.tachiyomi.util.waifu2x.UpscaleModelRegistry
 import eu.kanade.tachiyomi.util.storage.CbzCrypto
 import eu.kanade.tachiyomi.util.storage.CbzCrypto.getCoverStream
 import mihon.core.common.archive.archiveReader
@@ -29,6 +32,11 @@ import java.io.BufferedInputStream
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /**
  * A [Decoder] that uses built-in [ImageDecoder] to decode images that is not supported by the system.
@@ -82,7 +90,9 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
      * 拿到已初始化的 [decoder] 后，完成采样 / 解码 / 增强 / 硬件位图转换，返回结果。
      * 封面归档特例与普通页共用此逻辑。
      */
-    private fun decodeWith(decoder: ImageDecoder): DecodeResult {
+    private suspend fun decodeWith(decoder: ImageDecoder): DecodeResult {
+        val decodeJob = currentCoroutineContext()[Job]
+        val shouldCancel = { decodeJob?.isActive == false || Thread.currentThread().isInterrupted }
         // Komiho:「从 0 开始解码」的计时起点 —— 角标显示的实际计算耗时从这里算起，
         // 等锁与线程排队会被剔除（见 EnhanceTimings）。
         val decodeStart = android.os.SystemClock.uptimeMillis()
@@ -134,8 +144,12 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
             scale = options.scale,
         )
 
-        var bitmap = decoder.decode(sampleSize = sampleSize)
-        decoder.recycle()
+        var bitmap = try {
+            decodeJob?.ensureActive()
+            decoder.decode(sampleSize = sampleSize)
+        } finally {
+            decoder.recycle()
+        }
 
         check(bitmap != null) { "Failed to decode image" }
 
@@ -189,18 +203,68 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
             }
         }
 
+        if (options.stripEnhancement != null && options.enhanced && !options.originalSizeDisplay &&
+            !skipAi && isTallStrip && preferences.enhancementMode.get() == 5
+        ) {
+            UpscaleModelRegistry.ensureScanned(context)
+            val model = UpscaleModelRegistry.findById(preferences.aiModelId.get())
+            val plan = StripUpscalePlan.create(
+                bitmap.width, bitmap.height, AiUpscalePlan.normalizeScale(preferences.aiScale.get()),
+                model.scale, model.padding,
+            )
+            if (plan != null) {
+                if (shouldCancel()) {
+                    bitmap.recycle()
+                    throw CancellationException("Reader image request cancelled")
+                }
+                options.stripEnhancement?.plan = plan
+                // Keep software pixels for viewport bands. Whole-strip 3x/4x output
+                // is never allocated, and the original is immediately readable.
+                return DecodeResult(bitmap.asImage(), isSampled = sampleSize > 1)
+            }
+        }
+
         // MihonSY: run Lanczos3 enhancement synchronously on the decoded bitmap. The
         // decoder is called on Coil's background thread, so this never blocks the UI.
         // Any failure leaves the original bitmap — a black frame can never appear.
         // Applies to every image size (strips included, sampled by width only).
         if (options.enhanced) {
             try {
+                if (shouldCancel()) throw CancellationException("Reader image request cancelled")
                 // Komiho: 降噪已独立于增强档位——mode 0 + 降噪开启也要进链路（只降噪不增强）。
                 if (preferences.enhancementMode.get() != 0 || preferences.denoiseLevel.get() != 0) {
                     if (skipAi) {
                         // Komiho: AI 跳过门命中 —— 登记 skip，角标显示「跳过」，原图直出。
                         EnhanceTimings.markSkipped(options.pageIndex)
                     } else {
+                        if (preferences.enhancementMode.get() == 5 && !options.originalSizeDisplay) {
+                            options.enhancementPreview?.let { publish ->
+                                // Preview and final decode share the same source read. The small
+                                // independent bitmap stays valid while AI owns the full-size input.
+                                val previewSource = bitmap
+                                var preview: Bitmap? = null
+                                try {
+                                    val ratio = minOf(
+                                        1.0,
+                                        dstWidth.coerceAtLeast(1).toDouble() / previewSource.width,
+                                        sqrt(1_500_000.0 / (previewSource.width.toDouble() * previewSource.height)),
+                                    )
+                                    val scaled = Bitmap.createScaledBitmap(
+                                        previewSource,
+                                        max(1, (previewSource.width * ratio).roundToInt()),
+                                        max(1, (previewSource.height * ratio).roundToInt()),
+                                        true,
+                                    )
+                                    preview = if (scaled === previewSource) previewSource.copy(Bitmap.Config.ARGB_8888, false) else scaled
+                                    preview?.let { publish(EnhancementPreview(it, previewSource.width, previewSource.height)) }
+                                    preview = null // Ownership transferred to the preview callback.
+                                } catch (e: OutOfMemoryError) {
+                                    preview?.recycle()
+                                } catch (e: Exception) {
+                                    preview?.recycle()
+                                }
+                            }
+                        }
                         // Komiho 诊断：来源标识 = 谁发起的 + 第几页。
                         // 用来判断并发增强请求是「同一页被算了两遍」还是「相邻两页各一次」——
                         // 同包内取 top-level 扩展，无需 import。
@@ -222,6 +286,7 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
                             sourceTag = sourceTag,
                             // Komiho: 页号透传给增强器 —— 角标按页登记引擎，别让并发页互相覆盖。
                             pageIndex = options.pageIndex,
+                            shouldCancel = shouldCancel,
                         )
                         // Komiho (2026-09-30): AI 面积回缩（防摩尔纹）。SSIV 对 bitmap 源是
                         // 整图双线性缩小、无低通，AI 2x 的高频网点与屏幕像素网格拍频出摩尔纹；
@@ -267,11 +332,19 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
                         }
                     }
                 }
+            } catch (e: CancellationException) {
+                bitmap.recycle()
+                throw e
             } catch (e: Throwable) {
                 // Fall back to the original on ANY failure (incl. OutOfMemoryError,
                 // which Exception does not catch — an OOM here used to crash the
                 // whole reader on large downloaded pages).
             }
+        }
+
+        if (shouldCancel()) {
+            bitmap.recycle()
+            throw CancellationException("Reader image request cancelled")
         }
 
         if (

@@ -318,23 +318,42 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
   if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0)
     return bitmap;
 
+  struct BitmapUnlock {
+    JNIEnv *env;
+    jobject bitmap;
+    bool locked = true;
+    void unlock() {
+      if (locked) AndroidBitmap_unlockPixels(env, bitmap);
+      locked = false;
+    }
+    ~BitmapUnlock() { unlock(); }
+  } input_lock{env, bitmap};
+
+  // The Kotlin scheduler admits one inference at a time. QNN can read the
+  // locked bitmap directly; a second full RGBA allocation is unnecessary.
+  std::unique_lock<std::mutex> lock(g_lock);
+  const bool qnn_active = qnn_backend::is_initialized();
+
   const int w = info.width;
   const int h = info.height;
   const int stride = info.stride;
 
   // Keep a packed RGBA copy for the fused Vulkan upload. This also lets the
   // staged path reconstruct its planar input without keeping Bitmap locked.
-  ncnn::Mat packed_input(w, h, (size_t)4u, 1);
-  if (packed_input.empty()) {
-    AndroidBitmap_unlockPixels(env, bitmap);
-    return bitmap;
+  ncnn::Mat packed_input;
+  if (!qnn_active) {
+    packed_input.create(w, h, (size_t)4u, 1);
+    if (packed_input.empty()) return bitmap;
+    for (int y = 0; y < h; y++) {
+      memcpy((unsigned char *)packed_input.data + (size_t)y * w * 4,
+             (const unsigned char *)pixels + (size_t)y * stride,
+             (size_t)w * 4);
+    }
+    input_lock.unlock();
   }
-  for (int y = 0; y < h; y++) {
-    memcpy((unsigned char *)packed_input.data + (size_t)y * w * 4,
-           (const unsigned char *)pixels + (size_t)y * stride,
-           (size_t)w * 4);
-  }
-  AndroidBitmap_unlockPixels(env, bitmap);
+  const auto *input_pixels = qnn_active ? static_cast<const uint8_t *>(pixels)
+                                        : static_cast<const uint8_t *>(packed_input.data);
+  const int input_stride = qnn_active ? stride : w * 4;
 
   // Komiho: alpha 探测同样挪出锁 —— 纯 CPU 扫描，只依赖 packed_input。
   bool input_has_alpha =
@@ -342,12 +361,13 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
       ANDROID_BITMAP_FLAGS_ALPHA_OPAQUE;
   if (input_has_alpha) {
     input_has_alpha = false;
-    const unsigned char *packed_pixels =
-        static_cast<const unsigned char *>(packed_input.data);
-    for (int i = 0; i < w * h; i++) {
-      if (packed_pixels[i * 4 + 3] != 255) {
-        input_has_alpha = true;
-        break;
+    for (int y = 0; y < h && !input_has_alpha; ++y) {
+      const auto *row = input_pixels + static_cast<size_t>(y) * input_stride;
+      for (int x = 0; x < w; ++x) {
+        if (row[x * 4 + 3] != 255) {
+          input_has_alpha = true;
+          break;
+        }
       }
     }
   }
@@ -355,8 +375,6 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
   // Inference Scope (GPU) - Holds Lock for entire duration of incremental
   // process
   {
-    std::unique_lock<std::mutex> lock(g_lock);
-
     // Update ID only after acquiring lock (now we are truly the active process)
     g_current_id.store(id);
     // Komiho: 本次跑完前先清掉，避免并发下把上一次的纯耗时当成这次的（拿不到就保持 -1）
@@ -366,7 +384,6 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
     // Komiho: QNN-only 模式下 g_waifu2x 可能尚未加载（ncnn 引擎与 QNN 引擎独立），
     // 所以这里不再以 g_waifu2x 为准入判据 —— 只要 QNN 已初始化就继续往下走；
     // 输出倍率由 QNN 的 context 自报（scale()），两者都没有时才失败返回。
-    const bool qnn_active = qnn_backend::is_initialized();
     if (!g_waifu2x && !qnn_active)
       return bitmap;
 
@@ -408,7 +425,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
           if (qnn_backend::is_initialized()) {
             const auto qnn_start = std::chrono::steady_clock::now();
             ret = qnn_backend::process_rgba(
-                static_cast<const uint8_t *>(packed_input.data), w, h, w * 4,
+                input_pixels, w, h, input_stride,
                 static_cast<uint8_t *>(outPixels), outInfo.stride, &g_progress,
                 &g_abort_processing);
             const auto qnn_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -421,7 +438,15 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                  static_cast<long long>(qnn_ms));
           }
 
-          if (ret != 0 && !g_abort_processing.load() && g_waifu2x &&
+          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && packed_input.empty()) {
+            packed_input.create(w, h, (size_t)4u, 1);
+            if (!packed_input.empty()) {
+              for (int y = 0; y < h; ++y)
+                memcpy(static_cast<uint8_t *>(packed_input.data) + static_cast<size_t>(y) * w * 4,
+                       input_pixels + static_cast<size_t>(y) * input_stride, static_cast<size_t>(w) * 4);
+            }
+          }
+          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && !packed_input.empty() &&
               g_waifu2x->has_gpu_pipeline()) {
             const auto fused_start = std::chrono::steady_clock::now();
             ret = g_waifu2x->process_gpu(packed_input, outPixels,
@@ -437,7 +462,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                  static_cast<long long>(fused_ms));
           }
 
-          if (ret != 0 && !g_abort_processing.load() && g_waifu2x) {
+          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && !packed_input.empty()) {
             LOGD("Fused GPU pipeline unavailable for this image; retrying staged path");
             const auto staged_start = std::chrono::steady_clock::now();
             ncnn::Mat in = ncnn::Mat::from_pixels(
@@ -476,6 +501,11 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
 
   if (ret != 0 || !outBitmap) {
     LOGE("Waifu2x process failed or aborted");
+    if (outBitmap && !env->ExceptionCheck()) {
+      const jclass bitmap_class = env->GetObjectClass(outBitmap);
+      const jmethodID recycle = env->GetMethodID(bitmap_class, "recycle", "()V");
+      if (recycle) env->CallVoidMethod(outBitmap, recycle);
+    }
     return bitmap; // Return original on failure
   }
 
