@@ -6,6 +6,22 @@
 
 [中文](./CHANGELOG.md) | [English](./CHANGELOG.en.md)
 
+## v1.3.0 (MihonSY)
+
+### Added
+
+- GPU / NPU AI upscale output choices: 2x, 3x, 4x, 5x and 6x; the default remains 2x.
+- Automatic scale reduction for large pages, a 36 MP output budget, and prompt intermediate bitmap cleanup.
+- Verified release signatures and SHA-256 checksums, with regression tests before publishing.
+
+### Fixed and improved
+
+- Scale changes refresh paged/webtoon readers and invalidate enhanced image caches.
+- Fixed NPU gray-mask preprocessing recycling an immutable full-color source bitmap.
+- Fixed update comparisons reporting older major versions as updates and crashing on short or malformed tags.
+- Pointed the updater and About link to yeibai2345/MihonSY.
+- Unified local repository release/preview workflows and stopped deleting existing release tags.
+
 ## v1.2.0 (MihonSY)
 
 ### New

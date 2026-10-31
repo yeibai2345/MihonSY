@@ -270,6 +270,9 @@ class ReaderPreferences(
 
     val lanczosScale: Preference<Int> = preferenceStore.getInt("pref_lanczos_scale", 200) // 150/200/300 = 1.5x/2x/3x
 
+    /** Requested AI output scale, independent of the CPU resampler. Large pages are capped safely. */
+    val aiScale: Preference<Int> = preferenceStore.getInt("pref_ai_scale", 2)
+
     /**
      * Komiho: tile edge (px) for the AI upscaler — forwarded to the native `tilesize` via
      * `nativeUpdatePerformanceConfig`. Only affects AI upscale (mode 5).
@@ -388,6 +391,7 @@ class ReaderPreferences(
     fun enhancementCacheKey(): String = buildString {
         append(enhancementMode.get())
         append('|').append(lanczosScale.get())
+        append('|').append(aiScale.get())
         append('|').append(aiModelId.get())
         append('|').append(aiTileSize.get())
         append('|').append(denoiseLevel.get())

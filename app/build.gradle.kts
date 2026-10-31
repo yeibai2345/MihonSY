@@ -29,8 +29,8 @@ android {
     defaultConfig {
         applicationId = "eu.kanade.mihonsy"
 
-        versionCode = 11
-        versionName = "1.2.1"
+        versionCode = 12
+        versionName = "1.3.0"
 
         buildConfigField("String", "UPSTREAM_VERSION", """"0.20.1"""")
 
@@ -46,7 +46,7 @@ android {
         create("mihonsy") {
             storeFile = file("../keystore/mihonmod.jks")
             storePassword = System.getenv("MIHONSY_STORE_PASSWORD") ?: "mihonmod123"
-            keyAlias = "mihonmod"
+            keyAlias = System.getenv("MIHONSY_KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "mihonmod"
             keyPassword = System.getenv("MIHONSY_KEY_PASSWORD") ?: "mihonmod123"
         }
     }
@@ -74,7 +74,7 @@ android {
             isMinifyEnabled = shrink
             isShrinkResources = shrink
             isProfileable = true
-            signingConfig = signingConfigs.getByName("mihonsy")
+            signingConfig = if (project.hasProperty("mihonsyUnsigned")) null else signingConfigs.getByName("mihonsy")
             setProguardFiles(listOf(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"))
 
             buildConfigField("String", "BUILD_TIME", "\"${getBuildTime(useLatestCommitTime = true)}\"")

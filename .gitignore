@@ -23,3 +23,5 @@ google-services.json
 # MihonSY: signing keystore must never be committed (stored in GitHub Secrets)
 /keystore/
 app/.cxx/
+__pycache__/
+*.pyc

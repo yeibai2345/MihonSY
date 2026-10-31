@@ -41,33 +41,27 @@ class GetApplicationRelease(
     }
 
     // SY -->
-    private fun isNewVersion(
+    internal fun isNewVersion(
         isPreview: Boolean,
         syDebugVersion: String,
         versionName: String,
         versionTag: String,
     ): Boolean {
-        // Removes prefixes like "r" or "v"
-        val newVersion = versionTag.replace("[^\\d.]".toRegex(), "")
         return if (isPreview) {
-            // Preview builds: based on releases in "jobobby04/TachiyomiSYPreview" repo
-            // tagged as something like "508"
-            val currentInt = syDebugVersion.toIntOrNull()
-            currentInt != null && newVersion.toInt() > currentInt
+            val current = syDebugVersion.toLongOrNull() ?: return false
+            val next = versionTag.removePrefix("r").removePrefix("v").toLongOrNull() ?: return false
+            next > current
         } else {
-            // Release builds: based on releases in "jobobby04/TachiyomiSY" repo
-            // tagged as something like "0.1.2"
-            val oldVersion = versionName.replace("[^\\d.]".toRegex(), "")
-
-            val newSemVer = newVersion.split(".").map { it.toInt() }
-            val oldSemVer = oldVersion.split(".").map { it.toInt() }
-
-            oldSemVer.mapIndexed { index, i ->
-                if (newSemVer[index] > i) {
-                    return true
-                }
+            fun parse(value: String): List<Long>? {
+                val match = Regex("^[vVrR]?(\\d+(?:\\.\\d+)*)(?:[-+].*)?$").matchEntire(value) ?: return null
+                return match.groupValues[1].split('.').map { it.toLongOrNull() ?: return null }
             }
-
+            val current = parse(versionName) ?: return false
+            val next = parse(versionTag) ?: return false
+            for (index in 0 until maxOf(current.size, next.size)) {
+                val comparison = (next.getOrElse(index) { 0L }).compareTo(current.getOrElse(index) { 0L })
+                if (comparison != 0) return comparison > 0
+            }
             false
         }
     }

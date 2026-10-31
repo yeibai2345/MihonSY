@@ -33,6 +33,7 @@ import dev.icerock.moko.resources.StringResource
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.util.system.openInBrowser
 import eu.kanade.tachiyomi.util.waifu2x.AiUpscaleModel
+import eu.kanade.tachiyomi.util.waifu2x.AiUpscalePlan
 import eu.kanade.tachiyomi.util.waifu2x.PluginUpscaleModel
 import eu.kanade.tachiyomi.util.waifu2x.UpscaleModelRegistry
 import eu.kanade.tachiyomi.util.waifu2x.UpscaleModelSpec
@@ -130,6 +131,7 @@ private fun EnhancementRootList(
 ) {
     val mode by preferences.enhancementMode.collectAsState()
     val modelId by preferences.aiModelId.collectAsState()
+    val aiScale by preferences.aiScale.collectAsState()
     // findById() 把未知/已卸载的模型 id 归一化到默认值，所以选中态永远有确定答案。
     val activeModel = UpscaleModelRegistry.findById(modelId)
 
@@ -206,7 +208,8 @@ private fun EnhancementRootList(
     EnhancementMethodRow(
         label = stringResource(MR.strings.enhancement_group_gpu),
         // 选中时显示当前生效的模型，未选中时显示这个后端上次选的那个（切回去会得到它）。
-        subtitle = if (gpuActive) activeModel.displayLabel() else gpuMemory.displayLabel(),
+        subtitle = (if (gpuActive) activeModel.displayLabel() else gpuMemory.displayLabel()) +
+            " · ${AiUpscalePlan.normalizeScale(aiScale)}x",
         selected = gpuActive,
         onClick = {
             activateGpu()
@@ -235,8 +238,8 @@ private fun EnhancementRootList(
             // 选中时显示当前生效的模型；未选中时只有「本机有效记忆」才显示，从未选过或记忆里的
             // 模型已卸载 / 不兼容时是占位符 —— 那时没有属于用户选择的值可显示。
             subtitle = when {
-                npuActive -> activeModel.displayLabel()
-                npuRemembered != null -> npuRemembered.displayLabel()
+                npuActive -> "${activeModel.displayLabel()} · ${AiUpscalePlan.normalizeScale(aiScale)}x"
+                npuRemembered != null -> "${npuRemembered.displayLabel()} · ${AiUpscalePlan.normalizeScale(aiScale)}x"
                 else -> PLACEHOLDER
             },
             selected = npuActive,
@@ -367,6 +370,8 @@ private fun GpuDetail(
             }
     }
 
+    AiScaleOptions(preferences)
+
     // 分块边长只影响 GPU 路径（NPU 的 tile 由 context 编译期固定）。
     EnhancementParamLabel(MR.strings.pref_ai_tile_size)
     SettingsChipRow {
@@ -451,8 +456,31 @@ private fun NpuDetail(
         }
     }
 
+    AiScaleOptions(preferences)
+
     EnhancementParamLabel(MR.strings.enhancement_detail_advanced)
     AiAdvancedOptions(preferences)
+}
+
+@Composable
+private fun AiScaleOptions(preferences: ReaderPreferences) {
+    val scale by preferences.aiScale.collectAsState()
+    EnhancementParamLabel(MR.strings.enhancement_scale)
+    SettingsChipRow {
+        AiUpscalePlan.SCALE_OPTIONS.forEach { value ->
+            FilterChip(
+                selected = AiUpscalePlan.normalizeScale(scale) == value,
+                onClick = { preferences.aiScale.set(value) },
+                label = { Text("${value}x") },
+            )
+        }
+    }
+    Text(
+        text = stringResource(MR.strings.ai_upscale_scale_summary),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = SettingsItemsPaddings.Horizontal, vertical = 4.dp),
+    )
 }
 
 /**

@@ -1093,7 +1093,6 @@
     <string name="migrationListScreen.skipActionLabel">Don\'t migrate</string>
     <string name="migrationListScreen.migrateNowActionLabel">Migrate now</string>
     <string name="migrationListScreen.copyNowActionLabel">Copy now</string>
-    <string name="migrationListScreen.copyNowActionLabel">Copy now</string>
     <string name="migrationListScreen.exitDialogTitle">Stop migrating?</string>
     <string name="migrationListScreen.exitDialog.stopLabel">Stop</string>
     <string name="migrationListScreen.exitDialog.cancelLabel">Cancel</string>
@@ -1124,6 +1123,7 @@
     <!-- Komiho: NPU 详情里「没有系列、或系列只有它一个」的模型统一归到这个组。 -->
     <string name="enhancement_series_standalone">Standalone</string>
     <string name="enhancement_scale">Scale</string>
+    <string name="ai_upscale_scale_summary">Higher scales take more time and memory. Large pages automatically use a lower scale to keep the output within 36 MP; if 2x cannot fit, the original is kept.</string>
     <string name="ai_bypass_fit">Force enhancement on high-resolution images</string>
     <string name="ai_area_downscale">Reduce moiré</string>
     <string name="ai_area_downscale_strength">Filter strength</string>

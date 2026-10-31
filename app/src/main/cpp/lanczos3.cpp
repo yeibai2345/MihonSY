@@ -451,6 +451,13 @@ Java_eu_kanade_tachiyomi_util_MihonSyEnhancer_nativeResample(
   return nativeResampleImpl(env, bitmap, scale, kernel);
 }
 
+// Exact dimensions avoid rounding drift when chaining AI passes at odd scales.
+extern "C" JNIEXPORT jobject JNICALL
+Java_eu_kanade_tachiyomi_util_MihonSyEnhancer_nativeResampleTo(
+    JNIEnv *env, jobject thiz, jobject bitmap, jint dstWidth, jint dstHeight) {
+  return resampleBitmapTo(env, bitmap, dstWidth, dstHeight, 3, 0.0f);
+}
+
 // Komiho: AI 2x 回缩到显式目标尺寸（kernel id 5 高斯，σ = 0.5×strength；strength 1.0/1.5/2.0
 // 对应轻/中/强）。目标大于源时钳回源尺寸（绝不放大）；与 nativeResample 的统一倍率不同，
 // 宽高比可各自独立。失败返回入参。
