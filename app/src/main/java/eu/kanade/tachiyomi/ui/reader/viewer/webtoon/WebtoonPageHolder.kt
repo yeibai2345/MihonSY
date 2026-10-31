@@ -21,6 +21,7 @@ import eu.kanade.tachiyomi.ui.reader.viewer.ReaderProgressIndicator
 import eu.kanade.tachiyomi.ui.webview.WebViewActivity
 import eu.kanade.tachiyomi.util.system.dpToPx
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -135,6 +136,7 @@ class WebtoonPageHolder(
             page?.let { viewer.activity.onPageLoaded(it) }
         }
         frame.onImageLoadError = { error -> setError(error) }
+        frame.onImagePreview = { onImageDecoded() }
         frame.onScaleChanged = { viewer.activity.hideMenu() }
     }
 
@@ -165,6 +167,8 @@ class WebtoonPageHolder(
             marginStart = margin.toInt()
         }
     }
+
+    fun onViewportChanged() = frame.onEnhancementViewportChanged()
 
     /**
      * Called when the view is recycled and added to the view pool.
@@ -289,7 +293,8 @@ class WebtoonPageHolder(
                 // Komiho: 记下本次解码请求归谁，供 onImageLoaded 回调记账。
                 renderingPage = currentPage
                 // Komiho 诊断：条漫页号（条漫不走 PagerPreparedCache，来源只会是 holder）。
-                frame.pageIndex = page?.index ?: -1
+                frame.pageIndex = currentPage.enhancementId
+                frame.enhancementCacheIdentity = "${currentPage.enhancementId}:${viewer.config.imageFingerprint()}"
                 frame.setImage(
                     source,
                     isAnimated,
@@ -321,7 +326,10 @@ class WebtoonPageHolder(
                 "render page=${currentPage.index} mode=$enhancementMode " +
                     "id=${System.identityHashCode(this)}",
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
+            if (page !== currentPage) return
             // Komiho: 章节缓存文件被清掉时（最常见于 App 退后台被系统清 cache 目录、回前台继续阅读）
             // 会在这里以 FileNotFoundException 冒出来 —— 此刻 page.status 仍是 Ready，报错给用户只会
             // 得到一个「点重试不生效」的死页（原因见 HttpPageLoader.retryPage 的注释）。交给 loader

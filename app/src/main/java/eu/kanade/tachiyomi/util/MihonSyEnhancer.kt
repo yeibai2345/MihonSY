@@ -58,7 +58,6 @@ object MihonSyEnhancer {
      * Komiho: 灰度掩膜的通道发散度阈值（/255）。≤ 此值视为灰度像素（容忍 JPEG 色噪
      * ±2-3）；> 此值视为彩色像素，原样通过模型并保留输出色度。
      */
-    private const val GRAY_CHROMA_THRESHOLD = 8
 
     init {
         System.loadLibrary("mihonsy-enhance")
@@ -87,6 +86,8 @@ object MihonSyEnhancer {
     private external fun nativeLanczosProcess(bitmap: Bitmap, scale: Float): Bitmap
     private external fun nativeResample(bitmap: Bitmap, scale: Float, kernel: Int): Bitmap
     private external fun nativeResampleTo(bitmap: Bitmap, dstWidth: Int, dstHeight: Int): Bitmap
+    private external fun nativeClampGray(bitmap: Bitmap): ByteArray?
+    private external fun nativeNeutralizeChroma(bitmap: Bitmap, mask: ByteArray, srcWidth: Int)
 
     /**
      * Komiho: AI 2x 回缩到显式目标尺寸（native kernel id 5 高斯，σ = 0.5×[strength]，
@@ -228,8 +229,11 @@ object MihonSyEnhancer {
         onComplete: ((enhanced: Boolean, elapsedMillis: Long, gpuWaitMillis: Long) -> Unit)? = null,
         sourceTag: String = "",
         pageIndex: Int = -1,
+        shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
+        priorityOffset: () -> Int = { 0 },
     ): Bitmap? {
         val start = SystemClock.uptimeMillis()
+        if (shouldCancel()) return null
         if (input.isRecycled) {
             // Komiho: 什么都没做 —— 角标记成 skip，别落回 engineLabel 的默认值 CPU OK。
             EnhanceTimings.markSkipped(pageIndex)
@@ -289,99 +293,83 @@ object MihonSyEnhancer {
         // （解码采样不可避免），且 guided filter 代价与窗口无关，采样后尺寸
         // （~1-3MP）单页仅 ~100-200ms（Fast NLM 方案同尺寸实测 11s，已弃）。
         var src = input
-        val denoiseLevel = preferences.denoiseLevel.get()
-        if (denoiseLevel != 0) {
-            src = denoiseForAi(src, denoiseLevel, sourceTag)
-        }
-
-        // Komiho (2026-10-01): AI 灰度掩膜 —— 电子漫画网点经 HTP 管线后通道发散，表现为网点
-        // 边缘的彩色色块。推理前把「近灰度像素」钳位为中性（R=G=B=亮度），推理后把这些像素
-        // 的输出色度中和掉；彩色像素（含彩色漫画整页、页内彩色插图）原样通过，零影响。
-        // 掩膜随结果在 [neutralizeChroma] 消费。
-        // ⚠️ 只对 QNN/HTP 建 —— Vulkan 从未出现色块，且原生 postproc 已整页强制中性，
-        // 在 Vulkan 上这一步是纯开销（判据与依据见 [needsGrayMask]）。
-        var grayMask: Pair<ByteArray, Int>? = null
-        if (mode == 5 && needsGrayMask(preferences)) {
-            val clamped = clampGrayForAi(src)
-            src = clamped.first
-            grayMask = clamped.second
-        }
-
-        val result = when (mode) {
-            // Komiho: 降噪独立档——mode 0 只做降噪不增强（降噪已在上方完成，src 即结果）。
-            0 -> src
-            // MihonSY: Anime4K branch disabled — native side no longer compiled.
-            // 1 -> {
-            //     val a4kMode = preferences.anime4kMode.get()
-            //     val latch = java.util.concurrent.CountDownLatch(1)
-            //     var a4kResult: Bitmap? = null
-            //     var a4kError: Exception? = null
-            //     executor.execute {
-            //         try {
-            //             val argb = ensureArgb(input)
-            //             if (argb != null &&
-            //                 initAnime4K(Injekt.get<Application>(), a4kMode) &&
-            //                 anime4kSupportsSize(argb.width, argb.height, a4kMode)
-            //             ) {
-            //                 a4kResult = nativeProcessAnime4K(argb).takeUnless { it === argb }
-            //             }
-            //         } catch (e: Exception) {
-            //             a4kError = e
-            //         } finally {
-            //             latch.countDown()
-            //         }
-            //     }
-            //     try { latch.await() } catch (e: InterruptedException) { Thread.currentThread().interrupt() }
-            //     if (a4kError != null) { logcat(LogPriority.WARN, a4kError) { "Anime4K enhancement failed" } }
-            //     a4kResult
-            // }
-
-            // MihonSY: CPU resamplers — Lanczos3 (2), Catmull-Rom (3).
-            // (Spline36 (4) disabled; kernel id: 0 = Lanczos3, 1 = Catmull-Rom,
-            //  3 = Mitchell-Netravali（GPU/AI 路线降采样用）native side.)
-            in 2..3 -> {
-                val scale = preferences.lanczosScale.get() / 100f
-                val argb = ensureArgb(src) ?: run {
-                    onComplete?.invoke(false, SystemClock.uptimeMillis() - start, 0L)
-                    return null
-                }
-                if (scale > 1f) {
-                    when (mode) {
-                        3 -> nativeResample(argb, scale, 1)
-                        // MihonSY: Spline36 (4) disabled.
-                        // 4 -> nativeResample(argb, scale, 2)
-                        else -> nativeLanczosProcess(argb, scale)
-                    }.takeUnless { it === argb }
-                } else {
-                    null
-                }
+        var ownedOutput: Bitmap? = null
+        try {
+            val denoiseLevel = preferences.denoiseLevel.get()
+            if (denoiseLevel != 0) {
+                src = denoiseForAi(src, denoiseLevel, sourceTag)
             }
 
-            // GPU / NPU AI upscale, with bounded passes up to the requested scale.
-            5 -> {
-                enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex)
+            // Komiho (2026-10-01): AI 灰度掩膜 —— 电子漫画网点经 HTP 管线后通道发散，表现为网点
+            // 边缘的彩色色块。推理前把「近灰度像素」钳位为中性（R=G=B=亮度），推理后把这些像素
+            // 的输出色度中和掉；彩色像素（含彩色漫画整页、页内彩色插图）原样通过，零影响。
+            // 掩膜随结果在 [neutralizeChroma] 消费。
+            // ⚠️ 只对 QNN/HTP 建 —— Vulkan 从未出现色块，且原生 postproc 已整页强制中性，
+            // 在 Vulkan 上这一步是纯开销（判据与依据见 [needsGrayMask]）。
+            var grayMask: Pair<ByteArray, Int>? = null
+            if (mode == 5 && needsGrayMask(preferences)) {
+                val clamped = clampGrayForAi(src)
+                if (src !== input && src !== clamped.first) src.recycle()
+                src = clamped.first
+                grayMask = clamped.second
             }
 
-            else -> null
+            val result = when (mode) {
+                // Komiho: 降噪独立档——mode 0 只做降噪不增强（降噪已在上方完成，src 即结果）。
+                0 -> src
+                // MihonSY: CPU resamplers — Lanczos3 (2), Catmull-Rom (3).
+                // (Spline36 (4) disabled; kernel id: 0 = Lanczos3, 1 = Catmull-Rom,
+                //  3 = Mitchell-Netravali（GPU/AI 路线降采样用）native side.)
+                in 2..3 -> {
+                    val scale = preferences.lanczosScale.get() / 100f
+                    val argb = ensureArgb(src) ?: run {
+                        onComplete?.invoke(false, SystemClock.uptimeMillis() - start, 0L)
+                        return null
+                    }
+                    try {
+                        if (scale > 1f) {
+                            when (mode) {
+                                3 -> nativeResample(argb, scale, 1)
+                                else -> nativeLanczosProcess(argb, scale)
+                            }.takeUnless { it === argb }
+                        } else {
+                            null
+                        }
+                    } finally {
+                        if (argb !== src) argb.recycle()
+                    }
+                }
+
+                // GPU / NPU AI upscale, with bounded passes up to the requested scale.
+                5 -> {
+                    enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex, shouldCancel, priorityOffset)
+                }
+
+                else -> null
+            }
+            // 降噪产物只被本次增强消费（下游返回的都是新位图，见 enhanceWithGpu / 重采样），
+            // 及时回收，避免大图滞留到 GC。仅当 src 是新位图（≠ input）且不是最终返回对象时回收。
+            // 掩膜在 src 回收前消费：输出色度中和按 src 尺寸缩放掩膜坐标。
+            ownedOutput = result
+            if (grayMask != null && result != null && result !== src) {
+                neutralizeChroma(result, grayMask.first, grayMask.second)
+            }
+            // 只在结果确实是新对象时才缩（避免误 recycle 调用方仍在用的 input）。
+            val capped = if (result != null && result !== input) capOutputSize(result) else result
+            ownedOutput = capped
+            onComplete?.invoke(
+                capped != null && capped !== input,
+                SystemClock.uptimeMillis() - start,
+                // Sum scheduler waiting across every AI pass.
+                gpuTiming?.totalWaitMs() ?: 0L,
+            )
+            if (src === capped) src = input // Transfer a denoise-only result to the caller.
+            ownedOutput = null
+            return capped
+        } finally {
+            ownedOutput?.takeUnless { it === input || it.isRecycled }?.recycle()
+            src.takeUnless { it === input || it.isRecycled }?.recycle()
         }
-        // 降噪产物只被本次增强消费（下游返回的都是新位图，见 enhanceWithGpu / 重采样），
-        // 及时回收，避免大图滞留到 GC。仅当 src 是新位图（≠ input）且不是最终返回对象时回收。
-        // 掩膜在 src 回收前消费：输出色度中和按 src 尺寸缩放掩膜坐标。
-        if (grayMask != null && result != null && result !== src) {
-            neutralizeChroma(result, grayMask.first, grayMask.second)
-        }
-        if (src !== input && (result == null || result !== src)) src.recycle()
-        // 只在结果确实是新对象时才缩（避免误 recycle 调用方仍在用的 input）。
-        val capped = if (result != null && result !== input) capOutputSize(result) else result
-        onComplete?.invoke(
-            capped != null && capped !== input,
-            SystemClock.uptimeMillis() - start,
-            // Komiho: 传「等锁总时长」而不是单纯的 waitMs —— process() 里其实是两次拿 g_lock，
-            // nativeProcess 内部那次排队会被算进 procMs（实测某页 wait=2413 却 proc=4913，
-            // 原生自报只跑了 2449）。角标要剔除的是两段之和，见 Waifu2x.Timing.totalWaitMs()。
-            gpuTiming?.totalWaitMs() ?: 0L,
-        )
-        return capped
     }
 
     /**
@@ -533,7 +521,7 @@ object MihonSyEnhancer {
     }
 
     /**
-     * Komiho (2026-10-01): 本次 AI 增强是否需要 Kotlin 侧的灰度掩膜。
+     * Komiho (2026-10-01): 本次 AI 增强是否需要原生灰度预处理和色度保护。
      *
      * **只有 QNN/HTP（NPU）需要**。HTP 管线的 NHWC 包装与 I/O 量化会让灰度网点的边缘产生
      * 通道发散（彩色色块），**与权重精度无关** —— npu 的 fp16 与 int8 模型都需要（已确认）。
@@ -559,6 +547,8 @@ object MihonSyEnhancer {
         sourceTag: String = "",
         timing: Waifu2x.Timing? = null,
         pageIndex: Int = -1,
+        shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
+        priorityOffset: () -> Int = { 0 },
     ): Bitmap? {
         val plan = AiUpscalePlan.create(
             input.width,
@@ -568,9 +558,10 @@ object MihonSyEnhancer {
         ) ?: return null
         var current = input
         try {
-            current = ensureArgb(input) ?: return null
+            // JNI only reads input pixels. Immutable ARGB images need no copy.
+            current = if (input.config == Bitmap.Config.ARGB_8888) input else ensureArgb(input) ?: return null
             for (pass in plan.passes) {
-                if (Thread.currentThread().isInterrupted) {
+                if (shouldCancel()) {
                     EnhanceTimings.markInterrupted(pageIndex)
                     return null
                 }
@@ -582,7 +573,7 @@ object MihonSyEnhancer {
                 }
                 val passTiming = Waifu2x.Timing()
                 val upscaled = try {
-                    enhanceAiPass(current, preferences, sourceTag, passTiming, pageIndex)
+                    enhanceAiPass(current, preferences, sourceTag, passTiming, pageIndex, shouldCancel, priorityOffset)
                 } finally {
                     timing?.let { it.previousPassWaitMs += passTiming.totalWaitMs() }
                 } ?: return null
@@ -616,6 +607,8 @@ object MihonSyEnhancer {
         sourceTag: String = "",
         timing: Waifu2x.Timing? = null,
         pageIndex: Int = -1,
+        shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
+        priorityOffset: () -> Int = { 0 },
     ): Bitmap? {
         if (Waifu2x.isSupported) {
             // Komiho: model and tile geometry are user preferences. Both are pushed before
@@ -642,6 +635,7 @@ object MihonSyEnhancer {
             var retry = 0
             val retryDeadline = SystemClock.uptimeMillis() + VISIBLE_RETRY_WINDOW_MS
             while (true) {
+                if (shouldCancel()) return null
                 val attemptStart = SystemClock.uptimeMillis()
                 Waifu2x.process(
                     app,
@@ -649,6 +643,8 @@ object MihonSyEnhancer {
                     id = pageIndex,
                     tag = sourceTag,
                     timing = timing,
+                    shouldCancel = shouldCancel,
+                    priorityOffset = priorityOffset,
                 )?.let { upscaled ->
                     // Komiho (2026-09-30): AI 2x 结果默认直接交 SSIV 缩放显示（2026-09-26 定稿）。
                     // 可选开关 [ReaderPreferences.aiAreaDownscale] 开启后，由解码器按视图尺寸
@@ -780,7 +776,7 @@ object MihonSyEnhancer {
 
     /**
      * Komiho (2026-10-01): AI 灰度掩膜（治电子漫画网点色块）。扫描 [src]，把通道发散度
-     * ≤ [GRAY_CHROMA_THRESHOLD] 的像素钳位为中性（R=G=B=亮度），并返回灰度掩膜
+     * ≤ 8 的像素钳位为中性（R=G=B=亮度），并返回灰度掩膜
      * (ByteArray, srcWidth) 供 [neutralizeChroma] 在推理输出上消费。彩色像素原样保留、
      * 掩膜记 0 —— 彩色漫画整页掩膜近似空集，行为与无掩膜完全一致。
      *
@@ -800,41 +796,16 @@ object MihonSyEnhancer {
                 return src to null
             }
         }
-        val w = argb.width
-        val h = argb.height
-        val pixels = IntArray(w * h)
-        argb.getPixels(pixels, 0, w, 0, 0, w, h)
-        val mask = ByteArray(w * h)
-        var grayCount = 0
-        for (i in pixels.indices) {
-            val p = pixels[i]
-            val r = (p shr 16) and 0xFF
-            val g = (p shr 8) and 0xFF
-            val b = p and 0xFF
-            val divergence = maxOf(
-                kotlin.math.abs(r - g),
-                kotlin.math.abs(g - b),
-                kotlin.math.abs(r - b),
-            )
-            if (divergence <= GRAY_CHROMA_THRESHOLD) {
-                val y = (r * 299 + g * 587 + b * 114) / 1000
-                pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
-                mask[i] = 1
-                grayCount++
-            }
+        val mask = try {
+            nativeClampGray(argb)
+        } catch (e: OutOfMemoryError) {
+            null
         }
-        if (grayCount == 0) {
-            // 整页彩色：钳位无效果，掩膜也不必建。
-            if (argb !== src) {
-                argb.recycle()
-            }
+        if (mask == null) {
+            if (argb !== src) argb.recycle()
             return src to null
         }
-        argb.setPixels(pixels, 0, w, 0, 0, w, h)
-        logcat(LogPriority.DEBUG) {
-            "Gray mask: ${grayCount * 100 / (w * h)}% gray (${w}x$h)"
-        }
-        return argb to (mask to w)
+        return argb to (mask to argb.width)
     }
 
     /**
@@ -845,29 +816,8 @@ object MihonSyEnhancer {
         if (result.isRecycled || result.config != Bitmap.Config.ARGB_8888 || !result.isMutable) {
             return
         }
-        val scale = result.width / srcWidth
-        if (scale <= 0) return
         try {
-            val w = result.width
-            val h = result.height
-            val pixels = IntArray(w * h)
-            result.getPixels(pixels, 0, w, 0, 0, w, h)
-            for (y in 0 until h) {
-                val srcRow = (y / scale) * srcWidth
-                var idx = y * w
-                for (x in 0 until w) {
-                    if (mask[srcRow + x / scale].toInt() == 1) {
-                        val p = pixels[idx]
-                        val r = (p shr 16) and 0xFF
-                        val g = (p shr 8) and 0xFF
-                        val b = p and 0xFF
-                        val y8 = (r * 299 + g * 587 + b * 114) / 1000
-                        pixels[idx] = (p and 0xFF000000.toInt()) or (y8 shl 16) or (y8 shl 8) or y8
-                    }
-                    idx++
-                }
-            }
-            result.setPixels(pixels, 0, w, 0, 0, w, h)
+            nativeNeutralizeChroma(result, mask, srcWidth)
         } catch (t: Throwable) {
             logcat(LogPriority.WARN, t) { "Chroma neutralize failed; keeping output" }
         }

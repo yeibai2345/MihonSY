@@ -7,35 +7,10 @@ import java.io.File
 import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
 
-/**
- * Komiho: ncnn + Vulkan AI upscaler.
- *
- * Ported from HaoweiLi97/mihon_img_upscale and trimmed to the Vulkan backend (no
- * Qualcomm NPU, no Anime4K, no depth estimation). The native side lives in
- * `libwaifu2x-jni.so` (`app/src/main/cpp/waifu2x{,_jni}.cpp`) and is only built for
- * ABIs whose ncnn SDK is present under `third_party/`.
- *
- * Models come from [UpscaleModelSpec]: scale and tile padding are per-model properties, and
- * the native engine is rebuilt whenever the selected model differs from the running one.
- * Unlike the CPU resamplers there is still no free-form scale factor — the scale is baked
- * into the network itself.
- */
+/** Serializes model initialization and inference for ncnn/Vulkan and Qualcomm QNN/HTP. */
 object Waifu2x {
 
-    /**
-     * Komiho: 单次推理的耗时拆分，用调用方传入的持有对象回传（不用共享字段，避免并发串号）。
-     *
-     * `process()` 里其实是**两次**拿 `g_lock`：
-     * - [waitMs]：第一次（`nativeClearAbortProcessing()` 要拿锁）—— 等**别人**推理跑完的排队时间；
-     * - `nativeProcess` 内部**再拿一次**，那段排队被并进了 [procMs]。
-     *
-     * ⇒ 单看 [waitMs] **不足以**剔除排队：实测某页 `wait=2413ms`、`procMs=4913ms`，而原生自报
-     * 本次只跑了 2449ms —— 多出来的 2464ms 就是第二次排队。所以引入 [nativeInferenceMs]
-     * （原生在每次运行结束时登记），由 [totalWaitMs] 把两段等锁一起算出来。
-     *
-     * 「显示增强状态」角标要的是「从 0 开始解码 + 增强的实际消耗」，必须把**两段**等锁都剔除，
-     * 否则并发时一页会被显示成 4–9 秒（实测 `wait` 可到 4.4s / 9.7s）。
-     */
+    /** Per-request timing: scheduler wait is separate from actual initialization and pixel work. */
     class Timing {
         @Volatile var waitMs = -1L
         @Volatile var procMs = -1L
@@ -56,15 +31,12 @@ object Waifu2x {
         /** Queue and retry time accumulated across the passes of one requested AI scale. */
         var previousPassWaitMs = 0L
 
-        /** 需要从「总流程」里剔除的等锁总时长（两段之和 + 重试损失）；拿不到拆分的部分按 0 计。 */
+        /** 需要从总流程剔除的队列等待与重试损失；像素转换和分配计入实际处理耗时。 */
         fun totalWaitMs(): Long {
             if (waitMs < 0) return previousPassWaitMs + retryLossMs
-            val secondWait = if (nativeInferenceMs > 0 && procMs > nativeInferenceMs) {
-                procMs - nativeInferenceMs
-            } else {
-                0L
-            }
-            return previousPassWaitMs + waitMs + secondWait + retryLossMs
+            // Admission now serializes the entire engine operation. Bitmap allocation
+            // and pixel conversion are real work, not a second queue to subtract.
+            return previousPassWaitMs + waitMs + retryLossMs
         }
     }
 
@@ -227,37 +199,25 @@ object Waifu2x {
      * this only records the intent; [ensureEngine] compares it against the running model and
      * short-circuits when they match, keeping the hot path free of extra work.
      *
-     * Note for the cross-HTP experiment: a QNN model is **never blacklisted** on failure, so
-     * every attempt still probes the real device. [lastFailedQnnModel] exists only for
-     * observability, letting the diagnostics distinguish "NPU actually ran" from
-     * "NPU was selected but the context did not load".
+     * Changing selection resets the NPU initialization cooldown.
      */
     fun setModel(model: UpscaleModelSpec) {
+        if (requestedModel != model) nextQnnRetryAt = 0L
         requestedModel = model
     }
 
     /**
      * Last QNN model whose context failed to initialise on this device, or null if the most
-     * recent attempt succeeded. Diagnostic only — nothing consults it to change behaviour.
+     * recent attempt succeeded. Used with the short initialization retry cooldown.
      */
     @Volatile
     var lastFailedQnnModel: UpscaleModelSpec? = null
         private set
 
-    /**
-     * The engine that actually produced the most recent successful inference.
-     *
-     * Komiho (2026-09-17): the reader badge used to report success/failure only, so a
-     * **silent fallback** looked identical to a real NPU run — the v81-on-v75 experiment was
-     * misread as "NPU works" for exactly that reason. The badge now reports the engine that
-     * genuinely ran, which is derived here from the live engine state rather than from what
-     * the user selected.
-     *
-     * [EngineKind.QNN_HTP] is reported only when the QNN engine is the one currently loaded
-     * ([activeModel] has the QNN backend); if init failed, [ensureEngine] has already swapped
-     * [requestedModel] to [AiUpscaleModel.Default], so the next successful run reports
-     * [EngineKind.NCNN_VULKAN] instead.
-     */
+    @Volatile
+    private var nextQnnRetryAt = 0L
+
+    /** Backend that actually completed native inference, including in-process GPU fallback. */
     enum class EngineKind { NONE, NCNN_VULKAN, QNN_HTP }
 
     /** Engine that ran the last successful [process] call; [EngineKind.NONE] if none yet. */
@@ -278,7 +238,7 @@ object Waifu2x {
      * Never evicted: the key space is the current chapter's page count, so it stays tiny and
      * is simply overwritten when another chapter is opened.
      */
-    private val engineByPage = java.util.concurrent.ConcurrentHashMap<Int, EngineKind>()
+    private val engineByPage = android.util.LruCache<Int, EngineKind>(256)
 
     /**
      * Komiho: engine that produced the image for [pageIndex].
@@ -295,106 +255,46 @@ object Waifu2x {
     // [EngineKind.NONE] 显示 SKIP，不再冒充 CPU 完成。CPU 重采样档（mode 2/3）的角标
     // 由 `ReaderPageImageView` 直接按档位显示 CPU OK，与本方法无关。
 
-    /**
-     * Komiho (2026-10-01): 当前可见页的页号（-1 = 未知）。阅读器**准备可见页**时写入 ——
-     * pager 见 `PagerViewer.onPrepareStart`，条漫在 `WebtoonViewer.onScrolled` 里按视口中线
-     * 所在页写（条漫原先从不写，闸门对它曾完全失效）。
-     *
-     * 三个消费方：[prioritizeEnhancement]（可见页永不排在预取之后）、[abortProcessing] 的守卫
-     * （不打断可见页的推理）、以及 `MihonSyEnhancer` 的可见页重试 —— 后两者是 2026-10-16 为
-     * issue #8 加的，所以「值过期」不再是「没有副作用」：
-     *
-     * ⚠️ 它是**章内页号**（`ReaderPage.index`），跨章会与新章的页号数值重复。因此：
-     * - 阅读器销毁 / 切换阅读模式时由 `PagerViewer.destroy()` 复位为 -1；
-     * - 引擎释放时由 [destroy] 复位为 -1；
-     * - 章内换章**没有**复位点（换章不销毁 viewer），残留值最坏的后果是「少打断一次」或
-     *   「让一张预取页多等一次有界重试」——方向安全，故不为此引入跨章判断。
-     * - 条漫侧（`WebtoonViewer.onScrolled`）也写它，但 webtoon 没有 abort 调用点，所以那边
-     *   只会影响优先级判定与可见页重试。
-     */
+    /** Center page; webtoons use session IDs so adjacent chapters cannot collide. */
     @Volatile
     var visiblePageIndex: Int = -1
+        set(value) {
+            field = value
+            scheduler.prioritiesChanged()
+        }
 
-    /**
-     * Komiho: 「准可见页」—— 条漫跨章预载的目标页（下一章第一页），-1 = 无。
-     *
-     * 为什么需要：`LinearLayoutManager` 正向逐项布局 ⇒ 目标页在同批预载里**最后**入队，而刚落进
-     * 预载区的中间页会先占住原生推理锁，「提前几屏 bind」换来的提前量就被它们吃光。这里把它按
-     * 可见页处理（见 [prioritizeEnhancement]）：跳过排队，并让其它预取等它跑完再进。
-     *
-     * 与 [visiblePageIndex] 同一套语义：只服务优先级判定，页号是**章内序号**，跨章撞号最多让某个
-     * 预取多插一次队，无副作用。由 `WebtoonViewer` 在跨章预载窗口开/关、目标渲染完成时登记或撤销。
-     */
+    /** Next chapter's first page, below visible work and above ordinary prefetch. */
     @Volatile
     var urgentPageIndex: Int = -1
-
-    /**
-     * Komiho (2026-10-01): 可见页优先闸门。
-     *
-     * 要解决的问题：进阅读器时 pager 窗口的 3 页会同时发起增强，而原生 `g_lock` 覆盖整次推理
-     * ⇒ 谁先到谁先跑。实测进入后 3 页串行 9.9 秒，可见页排在队尾（10.7 秒才出图）。
-     * `abortProcessing` 只能打断**正在跑**的那次，对「已发起、还在等锁」的无效。
-     *
-     * 规则：可见页**永不等待**（直接进）；预取在「有可见页正在跑」时等待，等它跑完再进。
-     * 因此最坏情况只是「预取被顺延」，不可能死锁 —— 可见页不受任何人阻塞，而预取等待的那个
-     * 计数只由可见页自己的 finally 递减。
-     *
-     * Komiho: 加入 [urgentPageIndex]（条漫跨章预载目标页）后变成**三档**，见 [Priority]：
-     * 准可见只插在预取之前，**绝不抢正在看的可见页**（否则等于削弱「可见页优先」这条保证）。
-     * 等待关系依旧无环（可见页不等任何人）⇒ 仍然不可能死锁。
-     *
-     * 包住的只有「进原生锁 → 推理 → 释放」这一段，[Timing] 的 wait/proc 口径不变。
-     */
-    private val gateLock = Object()
-    private var visibleInFlight = 0
-    private var urgentInFlight = 0
-
-    /**
-     * Komiho: 闸门档位。数值越大优先级越高，只影响「谁能先抢到原生推理锁」。
-     *
-     * - [VISIBLE]：用户正在看的那页（`visiblePageIndex`）—— 永不等待，且不受准可见页阻塞。
-     * - [URGENT]：条漫跨章预载目标页（[urgentPageIndex]）—— 只等可见页，插在预取之前。
-     * - [PREFETCH]：其余预取 —— 等可见页与准可见页都跑完才进。
-     */
-    private enum class Priority { PREFETCH, URGENT, VISIBLE }
-
-    private fun <T> prioritizeEnhancement(priority: Priority, block: () -> T): T {
-        // 先按优先级排队（可见页这一档直接跳过，是本闸门不会死锁的依据）。
-        if (priority != Priority.VISIBLE) {
-            synchronized(gateLock) {
-                while (visibleInFlight > 0 || (priority == Priority.PREFETCH && urgentInFlight > 0)) {
-                    try {
-                        gateLock.wait()
-                    } catch (e: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        break
-                    }
-                }
-            }
+        set(value) {
+            field = value
+            scheduler.prioritiesChanged()
         }
-        // 登记自己在飞，让更低优先级排队；预取谁也不挡，不需要计数。
-        when (priority) {
-            Priority.VISIBLE -> synchronized(gateLock) { visibleInFlight++ }
-            Priority.URGENT -> synchronized(gateLock) { urgentInFlight++ }
-            Priority.PREFETCH -> Unit
-        }
-        try {
-            return block()
-        } finally {
-            when (priority) {
-                // 无条件 notifyAll：等待方都在 while 里复核自己的条件，多唤醒只会多一次判断。
-                Priority.VISIBLE -> synchronized(gateLock) {
-                    visibleInFlight--
-                    gateLock.notifyAll()
-                }
-                Priority.URGENT -> synchronized(gateLock) {
-                    urgentInFlight--
-                    gateLock.notifyAll()
-                }
-                Priority.PREFETCH -> Unit
-            }
-        }
+
+    /** All intersecting strips are visible, even when the screen spans several pages. */
+    @Volatile
+    private var visibleWebtoonPages: Set<Int> = emptySet()
+
+    @Volatile
+    private var upcomingWebtoonPages: List<Int> = emptyList()
+
+    fun updateWebtoonPriorities(visible: Set<Int>, upcoming: List<Int>) {
+        visibleWebtoonPages = visible
+        upcomingWebtoonPages = upcoming
+        scheduler.prioritiesChanged()
     }
+
+    private fun priorityFor(id: Int): Int = when {
+        id < 0 -> 0
+        id == visiblePageIndex -> 100
+        id in visibleWebtoonPages -> 90
+        id == urgentPageIndex -> 80
+        id in upcomingWebtoonPages -> 70 - upcomingWebtoonPages.indexOf(id)
+        else -> 0
+    }
+
+    // Waiting requests are re-ranked on scroll; only one enters native initialization/inference.
+    private val scheduler = EnhancementScheduler()
 
     /**
      * Runs AI upscaling on [input]. **Blocking** — call it from a background thread.
@@ -409,10 +309,12 @@ object Waifu2x {
         id: Int = -1,
         tag: String = "",
         timing: Timing? = null,
+        shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
+        priorityOffset: () -> Int = { 0 },
     ): Bitmap? {
-        if (!libraryLoaded || input.isRecycled) return null
-        if (!ensureEngine(context)) return null
-        applyTileSizeIfNeeded()
+        if (!libraryLoaded || input.isRecycled || shouldCancel()) return null
+        val model = requestedModel
+        val tileSize = requestedTileSize
 
         val argb = if (input.config != Bitmap.Config.ARGB_8888) {
             try {
@@ -425,66 +327,38 @@ object Waifu2x {
         } ?: return null
 
         return try {
-            // Komiho 临时诊断（量完可删）：把「排队等待」与「纯推理」拆开。
-            // nativeClearAbortProcessing() 内部要拿 g_lock（waifu2x_jni.cpp:357-362），
-            // 所以它的耗时 ≈ 等上一个推理（可能 1–3 秒）释放锁的时间 = 排队等待。
-            // ⚠️ 这**只是第一段**排队：nativeProcess 内部还会再拿一次同样的锁，
-            // 那段被计入下面的 `inference`（用 pure= 才能摘出来，见 [Timing] 的说明）。
-            // 判据：wait 常年 ≈0 → 解码线程没被占住，方案 A 不必做；wait 经常上千毫秒
-            // → 线程饥饿真实存在，再考虑把增强搬出解码器。
-            // Komiho (2026-10-01): 优先闸门 —— 只包住「进原生锁 → 推理 → 释放」这一段，
-            // wait/proc 的计时口径完全不变。档位见 [Priority]：可见页 > 准可见页（条漫跨章预载的
-            // 目标页）> 预取；准可见只插在预取之前，绝不抢用户正在看的那一页。
-            val priority = when {
-                id < 0 -> Priority.PREFETCH
-                id == visiblePageIndex -> Priority.VISIBLE
-                urgentPageIndex >= 0 && id == urgentPageIndex -> Priority.URGENT
-                else -> Priority.PREFETCH
-            }
             var waitMs = 0L
             var procMs = 0L
-            // 闸门排队与原生锁排队是同一件事（都在等 GPU 空出来），所以一起计入 [waitMs]
-            // —— 角标据此剔除的总排队时间才不会漏掉这一段。
-            // 用 exh.log.DiagLog 而非项目 logcat()：release 构建下 XLog 级别是 WARN
-            // （App.kt 的 setupExhLogging），logcat() 的 DEBUG/INFO 会被整条吞掉；DiagLog
-            // 同时写 android.util.Log 与进程内缓冲，所以 logcat 与「导出诊断日志」都能拿到。
+            var pureMs = -1L
+            var processedEngine: EngineKind? = null
             val waitStart = android.os.SystemClock.uptimeMillis()
-            val out = prioritizeEnhancement(priority) {
-                nativeClearAbortProcessing()
+            val out = scheduler.run(priority = { priorityFor(id) + priorityOffset() }, cancelled = shouldCancel) {
                 waitMs = android.os.SystemClock.uptimeMillis() - waitStart
+                if (!ensureEngine(context, model, tileSize) || shouldCancel()) return@run null
+                applyTileSizeIfNeeded(tileSize)
+                nativeClearAbortProcessing()
 
                 val procStart = android.os.SystemClock.uptimeMillis()
                 val result = nativeProcess(argb, id)
                 procMs = android.os.SystemClock.uptimeMillis() - procStart
+                pureMs = nativeGetLastInferenceMs()
+                processedEngine = when (nativeGetLastProcessEngine()) {
+                    2 -> EngineKind.QNN_HTP
+                    1 -> EngineKind.NCNN_VULKAN
+                    else -> null
+                }
                 result
             }
 
-            // Komiho：记录**真正跑完的那台引擎**，供阅读器角标显示 CPU/GPU/NPU OK。
-            // 必须在推理成功之后才登记：只有 nativeProcess 返回了结果，才能说这条路径成立。
-            // activeModel 是引擎侧的事实（QNN 加载失败时 ensureEngine 已把它换成 Default），
-            // 所以这里读它而不是读 requestedModel —— 否则又会把「回落 Vulkan」报成 NPU。
-            // 2026-09-19：同时按 `id`（页号）登记 —— 角标是每页画的，而 lastEngine 是全局槽，
-            // 并发页（预取 + 当前页）会互相覆盖，见 [engineByPage] 的说明。
+            // Capture the actual native backend before the next admitted request can overwrite it.
             if (out != null && out !== argb) {
-                val kind = when (activeModel?.backend) {
-                    UpscaleModelSpec.Backend.QNN_HTP -> EngineKind.QNN_HTP
-                    UpscaleModelSpec.Backend.NCNN_VULKAN -> EngineKind.NCNN_VULKAN
-                    null -> null
-                }
+                val kind = processedEngine
                 if (kind != null) {
                     lastEngine = kind
                     if (id >= 0) {
-                        engineByPage[id] = kind
+                        engineByPage.put(id, kind)
                     }
                 }
-            }
-
-            // Komiho：原生自报的纯推理耗时（已剔除 nativeProcess 内部那次 g_lock 排队）。
-            // 读不到就保持 -1，角标退回「只剔第一段等锁」的旧口径（fail-open，不会算错方向）。
-            val pureMs = try {
-                nativeGetLastInferenceMs()
-            } catch (e: Throwable) {
-                -1L
             }
 
             timing?.waitMs = waitMs
@@ -497,7 +371,7 @@ object Waifu2x {
                 "Waifu2xTiming",
                 "wait=${waitMs}ms inference=${procMs}ms total=${waitMs + procMs}ms " +
                     "src=${argb.width}x${argb.height} from=${tag.ifEmpty { "?" }} " +
-                    "pure=${pureMs}ms queue2=${if (pureMs > 0) procMs - pureMs else -1}ms",
+                    "pure=${pureMs}ms pixelOverhead=${if (pureMs >= 0) (procMs - pureMs).coerceAtLeast(0) else -1}ms",
             )
 
             out?.takeUnless { it === argb }
@@ -512,18 +386,19 @@ object Waifu2x {
     /** Releases native resources. Safe to call when nothing is loaded. */
     fun destroy() {
         if (!libraryLoaded) return
-        try {
-            nativeDestroy()
-        } catch (e: Exception) {
-            logcat(LogPriority.WARN, e) { "Waifu2x: destroy failed" }
-        } finally {
-            isInitialized = false
-            activeModel = null
-            appliedTileSize = -1
-            // Komiho (2026-10-16): 引擎已释放，「当前可见页」不再有意义 —— 它是**章内页号**，
-            // 留着会被下一次阅读会话/另一种阅读模式当成同一页（守卫会少打断一次、
-            // 可见页重试也可能被误触发）。见 [visiblePageIndex] 的说明。
-            visiblePageIndex = -1
+        scheduler.run(priority = { Int.MAX_VALUE }, cancelled = { false }) {
+            try {
+                nativeDestroy()
+            } catch (e: Exception) {
+                logcat(LogPriority.WARN, e) { "Waifu2x: destroy failed" }
+            } finally {
+                isInitialized = false
+                activeModel = null
+                appliedTileSize = -1
+                visiblePageIndex = -1
+                urgentPageIndex = -1
+                updateWebtoonPriorities(emptySet(), emptyList())
+            }
         }
     }
 
@@ -653,8 +528,7 @@ object Waifu2x {
      * Forwards [requestedTileSize] to the native engine, skipping the call when unchanged.
      * Must run after [init] — `nativeUpdatePerformanceConfig` is a no-op while no engine exists.
      */
-    private fun applyTileSizeIfNeeded() {
-        val size = requestedTileSize
+    private fun applyTileSizeIfNeeded(size: Int) {
         if (size == appliedTileSize) return
         try {
             nativeUpdatePerformanceConfig(TILE_SLEEP_MS, size)
@@ -681,35 +555,34 @@ object Waifu2x {
      * engine with [AiUpscaleModel.Default], so an NPU selection can never degrade below the
      * status quo.
      */
-    private fun ensureEngine(context: Context): Boolean = synchronized(this) {
-        val model = requestedModel
+    private fun ensureEngine(context: Context, model: UpscaleModelSpec, tileSize: Int): Boolean = synchronized(this) {
         if (isInitialized && activeModel == model) return true
 
         if (model.backend == UpscaleModelSpec.Backend.QNN_HTP) {
+            if (lastFailedQnnModel == model && android.os.SystemClock.uptimeMillis() < nextQnnRetryAt) {
+                return ensureEngineLocked(context, AiUpscaleModel.Default)
+            }
             val ok = initQnnEngine(context, model)
             if (ok) {
                 isInitialized = true
                 activeModel = model
                 lastFailedQnnModel = null
+                nextQnnRetryAt = 0L
                 logcat(LogPriority.WARN) { "Waifu2x: NPU ACTIVE — ${model.id} running on HTP" }
                 // QNN 的 tile 几何来自 context（设置项对它不生效）——标记为「已应用」，
                 // 免得第一次 process 还去 nativeUpdatePerformanceConfig 白拿一次引擎锁。
-                appliedTileSize = requestedTileSize
+                appliedTileSize = tileSize
                 return true
             }
-            // Komiho（2026-09-17 跨 HTP 试验期）：**故意不回写偏好、也不拉黑**。
-            // 这次是在多台高通机上试「v81 context 到底能不能跑」，一旦失败就把设置改回
-            // Default，用户在界面上看不到自己选了什么，也无法重试 —— 测试就做不下去。
-            // 因此这里只做两件事：留痕（下面这条 WARN 带 arch，一眼可判）+ 回落到 Vulkan
-            // 保证当页仍能出图。恢复正常行为时再把 onQnnFallback 接回去即可。
+            // Keep the selected model, but reuse GPU fallback for 30 seconds before retrying NPU.
             lastFailedQnnModel = model
+            nextQnnRetryAt = android.os.SystemClock.uptimeMillis() + 30_000L
             logcat(LogPriority.WARN) {
                 "Waifu2x: NPU UNAVAILABLE — QNN init failed for ${model.id} " +
                     "(on-chip HTP v$detectedQnnArchitecture vs packed arches " +
                     "${model.qnnArches.joinToString { it.toString() }}); " +
                     "falling back to Vulkan Default"
             }
-            requestedModel = AiUpscaleModel.Default
             onQnnFallback?.invoke(model)
             return ensureEngineLocked(context, AiUpscaleModel.Default)
         }
@@ -724,6 +597,7 @@ object Waifu2x {
 
     /** Vulkan/ncnn branch of [ensureEngine] (kept out of the dispatcher for clarity). */
     private fun ensureEngineLocked(context: Context, model: UpscaleModelSpec): Boolean {
+        if (isInitialized && activeModel == model) return true
         val dir = prepareModel(context, model)
         if (dir == null) {
             logcat(LogPriority.WARN) { "Waifu2x: model assets missing for ${model.id}" }
@@ -1027,6 +901,8 @@ object Waifu2x {
      * 若 .so 里没有这个符号（例如本地 ABI 没更新）会抛 UnsatisfiedLinkError —— 调用处已兜住。
      */
     private external fun nativeGetLastInferenceMs(): Long
+
+    private external fun nativeGetLastProcessEngine(): Int
 
     /**
      * Komiho: forwards tile geometry to the running engine (`waifu2x_jni.cpp:606`).

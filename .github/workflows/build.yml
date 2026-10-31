@@ -62,6 +62,8 @@ jobs:
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
       - name: Run regression tests
         run: |
+          c++ -std=c++17 -O2 -I app/src/main/cpp app/src/test/cpp/upscale_pixels_test.cpp -o /tmp/upscale-pixels-test
+          /tmp/upscale-pixels-test
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest :domain:test --no-daemon --stacktrace
       - name: Build test APK

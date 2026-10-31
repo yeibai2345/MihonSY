@@ -2,6 +2,8 @@
 // HaoweiLi97/mihon_img_upscale (Apache-2.0), minus the spatial-depth parts.
 // MIHON_ENABLE_QNN=0 compiles to stubs (probe fails, process returns -1).
 #include "qnn_backend.h"
+#include "upscale_pixels.h"
+#include "native_log.h"
 
 #include <algorithm>
 #include <android/log.h>
@@ -22,9 +24,9 @@
 #endif
 
 #define TAG "QnnBackend"
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOGD(...) mihonsy_native_log(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#define LOGW(...) mihonsy_native_log(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+#define LOGE(...) mihonsy_native_log(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 namespace qnn_backend {
 
@@ -217,35 +219,7 @@ uint16_t float_to_half(float value) {
                                ((mantissa + 0x00001000u) >> 13));
 }
 
-float half_to_float(uint16_t value) {
-  const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
-  uint32_t exponent = (value >> 10) & 0x1fu;
-  uint32_t mantissa = value & 0x03ffu;
-  uint32_t bits;
-
-  if (exponent == 0) {
-    if (mantissa == 0) {
-      bits = sign;
-    } else {
-      int shift = 0;
-      while ((mantissa & 0x0400u) == 0) {
-        mantissa <<= 1;
-        ++shift;
-      }
-      mantissa &= 0x03ffu;
-      bits = sign | (static_cast<uint32_t>(127 - 15 - shift) << 23) |
-             (mantissa << 13);
-    }
-  } else if (exponent == 31) {
-    bits = sign | 0x7f800000u | (mantissa << 13);
-  } else {
-    bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
-  }
-
-  float result;
-  std::memcpy(&result, &bits, sizeof(result));
-  return result;
-}
+using upscale_pixels::half_to_float;
 
 int reflect_coordinate(int coordinate, int size) {
   if (size <= 1) {
@@ -467,6 +441,19 @@ public:
       set_client_buffer(output_, output_quant8_buffer_.data(),
                         output_quant8_buffer_.size());
     }
+    pixel_tables_.build(
+        [&](float value) -> uint16_t {
+          if (is_fp16_tensor(input_)) return float_to_half(value);
+          if (is_quant16_tensor(input_)) return quantize_uint16(value, input_);
+          return quantize_uint8(value, input_);
+        },
+        [&](uint16_t value) -> float {
+          if (is_fp16_tensor(output_)) return half_to_float(value);
+          if (is_quant16_tensor(output_)) return dequantize_uint16(value, output_);
+          return dequantize_uint8(static_cast<uint8_t>(value), output_);
+        },
+        is_quant8_tensor(output_) ? 256 : 65536);
+    input_x_coordinates_.resize(tile_size_);
     padding_ = std::clamp(padding, 0, 48);
     configure_performance();
     initialized_ = true;
@@ -491,6 +478,7 @@ public:
     const int rows = (height + core - 1) / core;
     const int total_tiles = columns * rows;
     int completed = 0;
+    int cached_tiles = 0;
     std::chrono::nanoseconds prepare_time{0};
     std::chrono::nanoseconds execute_time{0};
     std::chrono::nanoseconds output_time{0};
@@ -501,13 +489,22 @@ public:
           return -2;
         }
         auto stage_start = std::chrono::steady_clock::now();
-        fill_input_tile(input, width, height, input_stride, tile_x - padding_,
-                        tile_y - padding_);
+        const int uniform_color = fill_input_tile(input, width, height, input_stride,
+                                                  tile_x - padding_, tile_y - padding_);
         prepare_time += std::chrono::steady_clock::now() - stage_start;
         const auto &qnn = provider_->QNN_INTERFACE_VER_NAME;
         stage_start = std::chrono::steady_clock::now();
-        const Qnn_ErrorHandle_t status =
-            qnn.graphExecute(graph_, &input_, 1, &output_, 1, nullptr, nullptr);
+        const size_t output_bytes = output_.v2.clientBuf.dataSize;
+        const auto *cached = uniform_tiles_.find(uniform_color, output_bytes);
+        Qnn_ErrorHandle_t status = QNN_SUCCESS;
+        if (cached) {
+          std::memcpy(output_.v2.clientBuf.data, cached, output_bytes);
+          ++cached_tiles;
+        } else {
+          status = qnn.graphExecute(graph_, &input_, 1, &output_, 1, nullptr, nullptr);
+          if (status == QNN_SUCCESS)
+            uniform_tiles_.remember(uniform_color, output_.v2.clientBuf.data, output_bytes);
+        }
         execute_time += std::chrono::steady_clock::now() - stage_start;
         if (status != QNN_SUCCESS) {
           LOGE("QNN graphExecute failed: %u", static_cast<unsigned>(status));
@@ -531,9 +528,9 @@ public:
     if (progress) {
       progress->store(100);
     }
-    LOGD("QNN tile profile: count=%d tile=%d core=%d prepare=%lldms "
+    LOGD("QNN tile profile: count=%d cached=%d tile=%d core=%d prepare=%lldms "
          "execute=%lldms output=%lldms",
-         total_tiles, tile_size_, core,
+         total_tiles, cached_tiles, tile_size_, core,
          static_cast<long long>(
              std::chrono::duration_cast<std::chrono::milliseconds>(prepare_time)
                  .count()),
@@ -567,6 +564,7 @@ public:
     input_quant8_buffer_.clear();
     output_quant8_buffer_.clear();
     binary_.clear();
+    uniform_tiles_.clear();
     tile_size_ = 0;
     output_tile_size_ = 0;
     scale_ = 0;
@@ -966,59 +964,31 @@ private:
     tensor.v2.clientBuf.dataSize = size;
   }
 
-  void fill_input_tile(const uint8_t *input, int width, int height, int stride,
+  int fill_input_tile(const uint8_t *input, int width, int height, int stride,
                        int origin_x, int origin_y) {
-    size_t index = 0;
-    for (int y = 0; y < tile_size_; ++y) {
-      const int source_y = reflect_coordinate(origin_y + y, height);
-      const uint8_t *row = input + static_cast<size_t>(source_y) * stride;
-      for (int x = 0; x < tile_size_; ++x) {
-        const int source_x = reflect_coordinate(origin_x + x, width);
-        const uint8_t *pixel = row + static_cast<size_t>(source_x) * 4;
-        for (int channel = 0; channel < 3; ++channel) {
-          const float value = pixel[channel] / 255.0f;
-          if (is_fp16_tensor(input_)) {
-            input_fp16_buffer_[index] = float_to_half(value);
-          } else if (is_quant16_tensor(input_)) {
-            input_quant16_buffer_[index] = quantize_uint16(value, input_);
-          } else {
-            input_quant8_buffer_[index] = quantize_uint8(value, input_);
-          }
-          ++index;
-        }
-      }
-    }
+    const auto pack = [&](auto *destination) {
+      return upscale_pixels::pack_tile(input, width, height, stride, origin_x, origin_y,
+                                tile_size_, pixel_tables_.input.data(), destination,
+                                input_x_coordinates_.data());
+    };
+    if (is_fp16_tensor(input_)) return pack(input_fp16_buffer_.data());
+    if (is_quant16_tensor(input_)) return pack(input_quant16_buffer_.data());
+    return pack(input_quant8_buffer_.data());
   }
 
   void write_output_tile(uint8_t *output, int output_stride, int target_x,
                          int target_y, int copy_width, int copy_height,
                          const uint8_t *input, int width, int height,
                          int input_stride) const {
-    const int source_offset = padding_ * scale_;
-    for (int y = 0; y < copy_height; ++y) {
-      uint8_t *row = output + static_cast<size_t>(target_y + y) * output_stride +
-                     static_cast<size_t>(target_x) * 4;
-      for (int x = 0; x < copy_width; ++x) {
-        const size_t source_index =
-            (static_cast<size_t>(source_offset + y) * output_tile_size_ +
-             source_offset + x) * 3;
-        for (int channel = 0; channel < 3; ++channel) {
-          const size_t index = source_index + channel;
-          const float raw_value =
-              is_fp16_tensor(output_)
-                  ? half_to_float(output_fp16_buffer_[index])
-                  : (is_quant16_tensor(output_)
-                         ? dequantize_uint16(output_quant16_buffer_[index], output_)
-                         : dequantize_uint8(output_quant8_buffer_[index], output_));
-          const float value = std::clamp(raw_value, 0.0f, 1.0f);
-          row[x * 4 + channel] = static_cast<uint8_t>(value * 255.0f + 0.5f);
-        }
-        const int alpha_x = std::min(width - 1, (target_x + x) / scale_);
-        const int alpha_y = std::min(height - 1, (target_y + y) / scale_);
-        row[x * 4 + 3] = input[static_cast<size_t>(alpha_y) * input_stride +
-                                 static_cast<size_t>(alpha_x) * 4 + 3];
-      }
-    }
+    const auto unpack = [&](const auto *source) {
+      upscale_pixels::unpack_tile(source, output_tile_size_, padding_ * scale_,
+                                  pixel_tables_.output.data(), output, output_stride,
+                                  target_x, target_y, copy_width, copy_height,
+                                  input, input_stride, scale_);
+    };
+    if (is_fp16_tensor(output_)) unpack(output_fp16_buffer_.data());
+    else if (is_quant16_tensor(output_)) unpack(output_quant16_buffer_.data());
+    else unpack(output_quant8_buffer_.data());
   }
 
   void *backend_library_ = nullptr;
@@ -1048,6 +1018,9 @@ private:
   std::vector<uint16_t> output_quant16_buffer_;
   std::vector<uint8_t> input_quant8_buffer_;
   std::vector<uint8_t> output_quant8_buffer_;
+  upscale_pixels::ConversionTables pixel_tables_;
+  std::vector<int> input_x_coordinates_;
+  upscale_pixels::UniformTileCache uniform_tiles_;
   int padding_ = 0;
   int tile_size_ = 0;
   int output_tile_size_ = 0;

@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.ui.reader.model
 
 import eu.kanade.tachiyomi.source.model.Page
 import java.io.InputStream
+import java.util.concurrent.atomic.AtomicInteger
 
 open class ReaderPage(
     index: Int,
@@ -17,6 +18,9 @@ open class ReaderPage(
 
 ) : Page(index, url, imageUrl, null), ReaderItem {
 
+    /** Session-unique AI id; adjacent chapters can both contain page index zero. */
+    val enhancementId: Int = nextEnhancementId.getAndIncrement()
+
     open lateinit var chapter: ReaderChapter
 
     /** Value to check if a page is too wide to be doubled up */
@@ -25,4 +29,8 @@ open class ReaderPage(
             field = value
             if (value) shiftedPage = false
         }
+
+    private companion object {
+        val nextEnhancementId = AtomicInteger(1_000_000)
+    }
 }
