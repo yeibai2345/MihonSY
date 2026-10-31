@@ -6,6 +6,25 @@
 
 [中文](./CHANGELOG.md) | [English](./CHANGELOG.en.md)
 
+## v1.3.2 (MihonSY)
+
+**MihonSY 1.3.2 (14)**
+
+- **Fixed** Model loading no longer leaves the NPU at maximum performance with sleep disabled. Power votes are owned by each inference and released on completion, failure or cancellation.
+- **Improved** Disable RPC busy polling, enable dynamic frequency scaling and allow sleep between work.
+- **Improved** Lower NPU frequency requests as Android thermal severity rises; critical temperature pauses new work and pauses active NPU work at tile boundaries.
+- **Changed** Restore the 1.2.1 presentation: complete the entire image before displaying it. Remove original-first previews and viewport overlays.
+- **Improved** Prioritize visible pages, limit directional lookahead to one adjacent page, and pause new offscreen AI prefetch during scrolling or warming.
+- **Improved** Keep distant webtoon sources compressed until admission, avoiding early bitmap allocations and decoder-slot occupation.
+- **Fixed** Ineligible queued requests do not occupy the inference slot; temperature-paused requests remain cancellable.
+- **Fixed** Carry page cancellation into native tile boundaries with unique request tokens so late cancellation cannot affect the next image.
+- **Improved** Integer-scale grayscale protection skips unmasked color runs and avoids per-output-pixel coordinate division, with unchanged pixels and alpha.
+- **Fixed** Stabilize full-image cache keys across initial view layout to reduce repeated enhancement when revisiting a page.
+- **Changed** Badges report complete-image processing time and final dimensions; cached results retain their original processing record.
+- **Improved** Add regression checks for thermal admission, scoped power votes, cancellation ownership and pixel equivalence.
+
+3x/4x retain genuine multi-pass AI. The existing 36 MP whole-image limit can reduce the selected scale or skip oversized images. Version 1.3.1 band timings measure visible regions and are not directly comparable with whole-image timings. Thermal control can increase per-image latency. No OnePlus Ace 5 latency or temperature measurements are available for this release, and no millisecond or fixed cooling claim is made.
+
 ## v1.3.1 (MihonSY)
 
 **MihonSY 1.3.1 (13)**

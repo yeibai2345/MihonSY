@@ -81,4 +81,43 @@ class EnhancementSchedulerTest {
         assertThrows(IllegalStateException::class.java) { scheduler.run({ 0 }) { error("native failure") } }
         assertEquals(42, scheduler.run({ 0 }) { 42 })
     }
+    @Test
+    fun `An ineligible prefetch cannot occupy the engine and resumes when allowed`() {
+        val scheduler = EnhancementScheduler()
+        val workers = Executors.newSingleThreadExecutor()
+        val eligible = AtomicBoolean(false)
+        try {
+            val waiting = workers.submit<Int?> {
+                scheduler.run({ 70 }, eligible = eligible::get) { 7 }
+            }
+            awaitQueue(scheduler, 1)
+            assertEquals(9, scheduler.run({ 90 }) { 9 })
+            assertTrue(!waiting.isDone)
+            eligible.set(true)
+            scheduler.prioritiesChanged()
+            assertEquals(7, waiting.get(3, TimeUnit.SECONDS))
+        } finally {
+            workers.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `A temperature-paused request can still be cancelled`() {
+        val scheduler = EnhancementScheduler()
+        val workers = Executors.newSingleThreadExecutor()
+        val cancelled = AtomicBoolean(false)
+        try {
+            val waiting = workers.submit<Int?> {
+                scheduler.run({ 100 }, cancelled::get, eligible = { false }) { error("must not run") }
+            }
+            awaitQueue(scheduler, 1)
+            cancelled.set(true)
+            scheduler.prioritiesChanged()
+            assertNull(waiting.get(3, TimeUnit.SECONDS))
+            assertEquals(0, scheduler.pendingCount)
+        } finally {
+            workers.shutdownNow()
+        }
+    }
+
 }

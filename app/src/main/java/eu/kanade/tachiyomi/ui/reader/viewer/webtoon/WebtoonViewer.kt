@@ -187,6 +187,7 @@ class WebtoonViewer(
             .threshold
 
     init {
+        Waifu2x.beginWebtoonSession()
         recycler.setItemViewCacheSize(RECYCLER_VIEW_CACHE_SIZE)
         recycler.isVisible = false // Don't let the recycler layout yet
         recycler.layoutParams = ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
@@ -201,6 +202,7 @@ class WebtoonViewer(
                 // —— 单页推理是 8 秒级，而连续滚动时惯性期很长。
                 override fun onScrollStateChanged(recyclerView: RecyclerView, newState: Int) {
                     Waifu2x.setUiBusy(newState == RecyclerView.SCROLL_STATE_DRAGGING)
+                    Waifu2x.setWebtoonScrolling(newState != RecyclerView.SCROLL_STATE_IDLE)
                 }
 
                 override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
@@ -364,8 +366,8 @@ class WebtoonViewer(
         syncUrgentPage()
         // Detaching the adapter recycles attached and cached holders, cancelling their work.
         recycler.adapter = null
-        Waifu2x.updateWebtoonPriorities(emptySet(), emptyList())
-        Waifu2x.visiblePageIndex = -1
+        Waifu2x.endWebtoonSession()
+        Waifu2x.setUiBusy(false)
         WebtoonImageCache.clear()
         super.destroy()
         scope.cancel()
@@ -531,13 +533,10 @@ class WebtoonViewer(
         if (first >= 0 && last >= first) {
             val visible = (first..last).mapNotNull { (adapter.items.getOrNull(it) as? ReaderPage)?.enhancementId }.toSet()
             val edge = if (enhancementScrollDirection > 0) last else first
-            val upcoming = (1..3).mapNotNull {
-                (adapter.items.getOrNull(edge + it * enhancementScrollDirection) as? ReaderPage)?.enhancementId
-            }
+            val upcoming = listOfNotNull(
+                (adapter.items.getOrNull(edge + enhancementScrollDirection) as? ReaderPage)?.enhancementId,
+            )
             Waifu2x.updateWebtoonPriorities(visible, upcoming)
-        }
-        for (childIndex in 0 until recycler.childCount) {
-            (recycler.getChildViewHolder(recycler.getChildAt(childIndex)) as? WebtoonPageHolder)?.onViewportChanged()
         }
 
         // Komiho: 跨章预载窗口复核（幂等）。放在最后 —— 此时 currentPage 才是最新的。

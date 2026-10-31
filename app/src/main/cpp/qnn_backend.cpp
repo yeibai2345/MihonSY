@@ -16,8 +16,10 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <thread>
 
 #if MIHON_ENABLE_QNN
+#include "qnn_power.h"
 #include <HTP/QnnHtpDevice.h>
 #include <QnnInterface.h>
 #include <System/QnnSystemInterface.h>
@@ -29,6 +31,9 @@
 #define LOGE(...) mihonsy_native_log(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 namespace qnn_backend {
+
+static std::atomic<int> thermal_status{0};
+void set_thermal_status(int status) { thermal_status.store(std::clamp(status, 0, 6)); }
 
 // ── Komiho (2026-09-18): ADSP_LIBRARY_PATH 必须在「首次 dlopen libQnnHtp.so」之前就位 ──
 //
@@ -477,6 +482,8 @@ public:
     const int columns = (width + core - 1) / core;
     const int rows = (height + core - 1) / core;
     const int total_tiles = columns * rows;
+    QnnPowerVote power(performance_infrastructure_);
+    bool power_warning_logged = false;
     int completed = 0;
     int cached_tiles = 0;
     std::chrono::nanoseconds prepare_time{0};
@@ -501,6 +508,18 @@ public:
           std::memcpy(output_.v2.clientBuf.data, cached, output_bytes);
           ++cached_tiles;
         } else {
+          // At critical temperature release the vote while waiting. The request-scoped
+          // cancellation signal still ends this wait when the reader leaves the page.
+          while (thermal_status.load() >= 4) {
+            power.release();
+            if (should_abort && should_abort->load()) return -2;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          }
+          if (should_abort && should_abort->load()) return -2;
+          if (!power.apply(thermal_status.load()) && !power_warning_logged) {
+            LOGE("QNN performance hint unavailable; using system-managed power policy");
+            power_warning_logged = true;
+          }
           status = qnn.graphExecute(graph_, &input_, 1, &output_, 1, nullptr, nullptr);
           if (status == QNN_SUCCESS)
             uniform_tiles_.remember(uniform_color, output_.v2.clientBuf.data, output_bytes);
@@ -529,7 +548,7 @@ public:
       progress->store(100);
     }
     LOGD("QNN tile profile: count=%d cached=%d tile=%d core=%d prepare=%lldms "
-         "execute=%lldms output=%lldms",
+         "execute=%lldms output=%lldms thermal=%d",
          total_tiles, cached_tiles, tile_size_, core,
          static_cast<long long>(
              std::chrono::duration_cast<std::chrono::milliseconds>(prepare_time)
@@ -539,7 +558,7 @@ public:
                  .count()),
          static_cast<long long>(
              std::chrono::duration_cast<std::chrono::milliseconds>(output_time)
-                 .count()));
+                 .count()), thermal_status.load());
     return 0;
   }
 
@@ -731,71 +750,11 @@ private:
         !performance_infrastructure_.destroyPowerConfigId) {
       return;
     }
-    status = performance_infrastructure_.createPowerConfigId(
-        0, 0, &power_config_id_);
-    if (status != QNN_SUCCESS) {
-      power_config_id_ = 0;
-      LOGE("QNN createPowerConfigId failed: %u",
-           static_cast<unsigned>(status));
-      return;
-    }
-
-    QnnHtpPerfInfrastructure_PowerConfig_t dcvs =
-        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIG_INIT;
-    dcvs.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
-    dcvs.dcvsV3Config.contextId = power_config_id_;
-    dcvs.dcvsV3Config.setDcvsEnable = 1;
-    dcvs.dcvsV3Config.dcvsEnable = 0;
-    dcvs.dcvsV3Config.powerMode =
-        QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
-    dcvs.dcvsV3Config.setSleepLatency = 1;
-    dcvs.dcvsV3Config.sleepLatency = 40;
-    dcvs.dcvsV3Config.setSleepDisable = 1;
-    dcvs.dcvsV3Config.sleepDisable = 1;
-    dcvs.dcvsV3Config.setBusParams = 1;
-    dcvs.dcvsV3Config.busVoltageCornerMin =
-        DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-    dcvs.dcvsV3Config.busVoltageCornerTarget =
-        DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-    dcvs.dcvsV3Config.busVoltageCornerMax =
-        DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-    dcvs.dcvsV3Config.setCoreParams = 1;
-    dcvs.dcvsV3Config.coreVoltageCornerMin =
-        DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-    dcvs.dcvsV3Config.coreVoltageCornerTarget =
-        DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-    dcvs.dcvsV3Config.coreVoltageCornerMax =
-        DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-
-    QnnHtpPerfInfrastructure_PowerConfig_t rpc_latency =
-        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIG_INIT;
-    rpc_latency.option =
-        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY;
-    rpc_latency.rpcControlLatencyConfig = 100;
-    QnnHtpPerfInfrastructure_PowerConfig_t rpc_polling =
-        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIG_INIT;
-    rpc_polling.option =
-        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
-    rpc_polling.rpcPollingTimeConfig =
-        QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIG_MAX_RPC_POLLING_TIME;
-    const QnnHtpPerfInfrastructure_PowerConfig_t *configs[] = {
-        &dcvs, &rpc_latency, &rpc_polling, nullptr};
-    status = performance_infrastructure_.setPowerConfig(power_config_id_,
-                                                         configs);
-    if (status != QNN_SUCCESS) {
-      LOGE("QNN setPowerConfig failed: %u", static_cast<unsigned>(status));
-      release_performance();
-      return;
-    }
-    LOGD("QNN HTP burst performance configuration enabled");
+    // Only discover the interface here; no persistent frequency or no-sleep vote.
+    LOGD("QNN HTP scoped thermal-aware performance available");
   }
 
   void release_performance() {
-    if (power_config_id_ != 0 &&
-        performance_infrastructure_.destroyPowerConfigId) {
-      performance_infrastructure_.destroyPowerConfigId(power_config_id_);
-    }
-    power_config_id_ = 0;
     performance_infrastructure_ = QNN_HTP_DEVICE_PERF_INFRASTRUCTURE_INIT;
   }
 
@@ -1027,7 +986,6 @@ private:
   int scale_ = 0;
   QnnHtpDevice_PerfInfrastructure_t performance_infrastructure_ =
       QNN_HTP_DEVICE_PERF_INFRASTRUCTURE_INIT;
-  uint32_t power_config_id_ = 0;
   bool initialized_ = false;
 };
 

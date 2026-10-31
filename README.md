@@ -6,7 +6,7 @@
 
 **基于 TachiyomiSY 的漫画阅读器，主打图像增强、条漫阅读增强与多设备同步**
 
-包名 `eu.kanade.mihonsy` ｜ 版本 1.3.1 (13) ｜ Android 8.0+
+包名 `eu.kanade.mihonsy` ｜ 版本 1.3.2 (14) ｜ Android 8.0+
 
 [中文](./README.md) | [English](./README.en.md)
 
@@ -29,7 +29,7 @@ MihonSY 是 [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY) 的一个分
 
 ### 1. 图像增强
 
-- **AI 超分（GPU）**：ncnn + Vulkan，内置 AnimeVideoMiniV18 / OmniMiniV2（默认）/ OmniTurboV15 三个模型，支持 **2x / 3x / 4x / 5x / 6x**，适用长条图按可见区域分段处理，其他大图自动降低倍率以控制内存。
+- **AI 超分（GPU）**：ncnn + Vulkan，内置 AnimeVideoMiniV18 / OmniMiniV2（默认）/ OmniTurboV15 三个模型，支持 **2x / 3x / 4x / 5x / 6x**，整图完成增强后显示，大图自动降低倍率以控制内存。
 - **AI 超分（NPU）**：Qualcomm QNN / HTP 硬件加速。
 - **Lanczos3 / Catmull-Rom**：经典插值，支持 **1.5x / 2x / 2.5x / 3x** 四档倍率（native 分离卷积实现）。
 - **降噪**：与增强解耦的独立开关（默认关），只平滑亮度、保持色相。
@@ -39,7 +39,7 @@ MihonSY 是 [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY) 的一个分
 
 ### 2. 条漫阅读增强
 
-- **分段 AI 超分**：原图先显示，当前区域优先，按阅读方向预取；重叠裁边、3x 对齐与会话缓存改善连续阅读。默认自动应用于符合条件的长图，无需新开关。
+- **整图 AI 超分**：完成增强后一次显示，当前页优先，滚动或升温时暂停新预取；会话缓存减少回看重算。NPU 性能请求随推理释放，并响应系统温控。
 
 - **点击滚动距离**：半屏 / 3/4 屏 / 全屏，三档可选（按阅读器实际可视高度计算，平板也能滚满一屏）。
 - **滚动动画**：时长 0–1000ms 可调（0 = 瞬时跳页）。

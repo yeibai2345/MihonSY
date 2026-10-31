@@ -230,7 +230,7 @@ object MihonSyEnhancer {
         sourceTag: String = "",
         pageIndex: Int = -1,
         shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
-        priorityOffset: () -> Int = { 0 },
+        canStart: () -> Boolean = { true },
     ): Bitmap? {
         val start = SystemClock.uptimeMillis()
         if (shouldCancel()) return null
@@ -342,7 +342,7 @@ object MihonSyEnhancer {
 
                 // GPU / NPU AI upscale, with bounded passes up to the requested scale.
                 5 -> {
-                    enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex, shouldCancel, priorityOffset)
+                    enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex, shouldCancel, canStart)
                 }
 
                 else -> null
@@ -548,7 +548,7 @@ object MihonSyEnhancer {
         timing: Waifu2x.Timing? = null,
         pageIndex: Int = -1,
         shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
-        priorityOffset: () -> Int = { 0 },
+        canStart: () -> Boolean = { true },
     ): Bitmap? {
         val plan = AiUpscalePlan.create(
             input.width,
@@ -573,7 +573,7 @@ object MihonSyEnhancer {
                 }
                 val passTiming = Waifu2x.Timing()
                 val upscaled = try {
-                    enhanceAiPass(current, preferences, sourceTag, passTiming, pageIndex, shouldCancel, priorityOffset)
+                    enhanceAiPass(current, preferences, sourceTag, passTiming, pageIndex, shouldCancel, canStart)
                 } finally {
                     timing?.let { it.previousPassWaitMs += passTiming.totalWaitMs() }
                 } ?: return null
@@ -608,7 +608,7 @@ object MihonSyEnhancer {
         timing: Waifu2x.Timing? = null,
         pageIndex: Int = -1,
         shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
-        priorityOffset: () -> Int = { 0 },
+        canStart: () -> Boolean = { true },
     ): Bitmap? {
         if (Waifu2x.isSupported) {
             // Komiho: model and tile geometry are user preferences. Both are pushed before
@@ -644,7 +644,7 @@ object MihonSyEnhancer {
                     tag = sourceTag,
                     timing = timing,
                     shouldCancel = shouldCancel,
-                    priorityOffset = priorityOffset,
+                    canStart = canStart,
                 )?.let { upscaled ->
                     // Komiho (2026-09-30): AI 2x 结果默认直接交 SSIV 缩放显示（2026-09-26 定稿）。
                     // 可选开关 [ReaderPreferences.aiAreaDownscale] 开启后，由解码器按视图尺寸
@@ -653,6 +653,7 @@ object MihonSyEnhancer {
                     return upscaled
                 }
                 val attemptMs = SystemClock.uptimeMillis() - attemptStart
+                if (shouldCancel()) return null
                 if (!Waifu2x.wasAborted(pageIndex)) break
                 // Komiho (2026-10-16): 当场把「本页被抢占过」登记到应用层 —— 原生那个打断记录
                 // （单槽）会被下一次推理清掉，几百毫秒后停顿补算再来查必然为 false（issue #8：

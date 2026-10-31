@@ -161,6 +161,22 @@ inline uint8_t luminance(const uint8_t *pixel) {
 
 inline void neutralize(uint8_t *output, int width, int height, int stride,
                         const uint8_t *mask, int mask_width, int mask_height) {
+  // AI outputs normally have an exact integer scale. Walk mask pixels once per
+  // output row and skip entire color runs, avoiding a 64-bit division per pixel.
+  if (width % mask_width == 0 && height % mask_height == 0) {
+    const int sx = width / mask_width, sy = height / mask_height;
+    for (int y = 0; y < height; ++y) {
+      auto *row = output + static_cast<size_t>(y) * stride;
+      const auto *mask_row = mask + static_cast<size_t>(y / sy) * mask_width;
+      for (int x = 0; x < mask_width; ++x) {
+        if (!mask_row[x]) continue;
+        auto *pixel = row + static_cast<size_t>(x) * sx * 4;
+        for (int dx = 0; dx < sx; ++dx, pixel += 4)
+          pixel[0] = pixel[1] = pixel[2] = luminance(pixel);
+      }
+    }
+    return;
+  }
   for (int y = 0; y < height; ++y) {
     auto *row = output + static_cast<size_t>(y) * stride;
     const auto *mask_row = mask + static_cast<size_t>(static_cast<int64_t>(y) * mask_height / height) * mask_width;

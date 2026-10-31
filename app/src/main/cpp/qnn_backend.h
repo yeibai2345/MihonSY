@@ -20,6 +20,7 @@ int process_rgba(const uint8_t *input, int width, int height, int input_stride,
                  std::atomic<int> *progress,
                  const std::atomic<bool> *should_abort);
 void shutdown();
+void set_thermal_status(int status);
 
 // Komiho (2026-09-18): 把 ADSP_LIBRARY_PATH 指向 nativeLibraryDir。
 // **必须在任何一次 dlopen("libQnnHtp.so") 之前调用**（见 qnn_backend.cpp 里的长注释）。

@@ -3,6 +3,12 @@ package eu.kanade.tachiyomi.util.waifu2x
 import android.content.Context
 import android.content.res.AssetManager
 import android.graphics.Bitmap
+import android.os.Build
+import android.os.PowerManager
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicInteger
 import java.io.File
 import logcat.LogPriority
 import tachiyomi.core.common.util.system.logcat
@@ -279,10 +285,78 @@ object Waifu2x {
     private var upcomingWebtoonPages: List<Int> = emptyList()
 
     fun updateWebtoonPriorities(visible: Set<Int>, upcoming: List<Int>) {
+        webtoonViewportKnown = true
         visibleWebtoonPages = visible
         upcomingWebtoonPages = upcoming
         scheduler.prioritiesChanged()
     }
+
+    @Volatile private var thermalStatus = 0
+    @Volatile private var monitoringThermals = false
+    @Volatile private var webtoonActive = false
+    @Volatile private var webtoonViewportKnown = false
+    @Volatile private var webtoonScrolling = false
+    private val bootstrapWebtoonPage = AtomicInteger(-1)
+
+    @Synchronized
+    fun ensureThermalMonitoring(context: Context) {
+        if (monitoringThermals) return
+        monitoringThermals = true
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        try {
+            val app = context.applicationContext
+            val power = app.getSystemService(PowerManager::class.java) ?: return
+            fun update(status: Int) {
+                thermalStatus = status.coerceIn(0, 6)
+                if (libraryLoaded) nativeSetThermalStatus(thermalStatus)
+                scheduler.prioritiesChanged()
+                logcat(LogPriority.INFO) { "AI thermal status=$thermalStatus" }
+            }
+            update(power.currentThermalStatus)
+            power.addThermalStatusListener(app.mainExecutor) { update(it) }
+        } catch (e: Exception) {
+            logcat(LogPriority.WARN, e) { "AI thermal monitoring unavailable; using balanced NPU votes" }
+        }
+    }
+
+    @Synchronized
+    fun beginWebtoonSession() {
+        webtoonActive = true
+        webtoonViewportKnown = false
+        bootstrapWebtoonPage.set(-1)
+        webtoonScrolling = false
+        visiblePageIndex = -1
+        visibleWebtoonPages = emptySet()
+        upcomingWebtoonPages = emptyList()
+        urgentPageIndex = -1
+    }
+
+    fun endWebtoonSession() {
+        webtoonActive = false
+        webtoonScrolling = false
+        updateWebtoonPriorities(emptySet(), emptyList())
+        visiblePageIndex = -1
+        urgentPageIndex = -1
+    }
+
+    fun setWebtoonScrolling(scrolling: Boolean) {
+        webtoonScrolling = scrolling
+        scheduler.prioritiesChanged()
+    }
+
+    fun canStartWebtoon(id: Int): Boolean {
+        if (!webtoonActive) return false
+        // Before the first RecyclerView layout, allow one page to establish geometry.
+        // Further requests wait without decoded bitmap allocations or Coil slots.
+        if (!webtoonViewportKnown) bootstrapWebtoonPage.compareAndSet(-1, id)
+        val priority = if (!webtoonViewportKnown && id == bootstrapWebtoonPage.get()) 90 else priorityFor(id)
+        return EnhancementLoadPolicy.canStart(priority, thermalStatus, webtoonScrolling)
+    }
+
+    private val requestTokens = AtomicLong()
+    private val cancellationWatcher = ScheduledThreadPoolExecutor(1) { task ->
+        Thread(task, "AI cancellation").apply { isDaemon = true }
+    }.apply { removeOnCancelPolicy = true }
 
     private fun priorityFor(id: Int): Int = when {
         id < 0 -> 0
@@ -310,9 +384,10 @@ object Waifu2x {
         tag: String = "",
         timing: Timing? = null,
         shouldCancel: () -> Boolean = { Thread.currentThread().isInterrupted },
-        priorityOffset: () -> Int = { 0 },
+        canStart: () -> Boolean = { true },
     ): Bitmap? {
         if (!libraryLoaded || input.isRecycled || shouldCancel()) return null
+        ensureThermalMonitoring(context)
         val model = requestedModel
         val tileSize = requestedTileSize
 
@@ -332,14 +407,26 @@ object Waifu2x {
             var pureMs = -1L
             var processedEngine: EngineKind? = null
             val waitStart = android.os.SystemClock.uptimeMillis()
-            val out = scheduler.run(priority = { priorityFor(id) + priorityOffset() }, cancelled = shouldCancel) {
+            val out = scheduler.run(
+                priority = { priorityFor(id) }, cancelled = shouldCancel,
+                eligible = { thermalStatus < 4 && canStart() },
+            ) {
                 waitMs = android.os.SystemClock.uptimeMillis() - waitStart
                 if (!ensureEngine(context, model, tileSize) || shouldCancel()) return@run null
                 applyTileSizeIfNeeded(tileSize)
                 nativeClearAbortProcessing()
 
                 val procStart = android.os.SystemClock.uptimeMillis()
-                val result = nativeProcess(argb, id)
+                val token = requestTokens.incrementAndGet()
+                val worker = Thread.currentThread()
+                val watcher = cancellationWatcher.scheduleWithFixedDelay({
+                    if (shouldCancel() || worker.isInterrupted) nativeCancelRequest(token)
+                }, 0, 50, TimeUnit.MILLISECONDS)
+                val result = try {
+                    if (shouldCancel()) null else nativeProcess(argb, id, token)
+                } finally {
+                    watcher.cancel(false)
+                }
                 procMs = android.os.SystemClock.uptimeMillis() - procStart
                 pureMs = nativeGetLastInferenceMs()
                 processedEngine = when (nativeGetLastProcessEngine()) {
@@ -891,7 +978,11 @@ object Waifu2x {
         padding: Int,
     ): Boolean
 
-    private external fun nativeProcess(bitmap: Bitmap, id: Int): Bitmap?
+    private external fun nativeProcess(bitmap: Bitmap, id: Int, token: Long): Bitmap?
+
+    private external fun nativeCancelRequest(token: Long)
+
+    private external fun nativeSetThermalStatus(status: Int)
 
     /**
      * Komiho: 原生登记的「最近一次推理纯耗时」（ms，不含等锁）；-1 = 未知。

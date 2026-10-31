@@ -2,7 +2,7 @@ package eu.kanade.tachiyomi.util.waifu2x
 
 /** One native engine, with priorities re-evaluated as the reader scrolls. */
 internal class EnhancementScheduler {
-    private class Request(val priority: () -> Int, val cancelled: () -> Boolean)
+    private class Request(val priority: () -> Int, val cancelled: () -> Boolean, val eligible: () -> Boolean)
 
     private val monitor = Object()
     private val pending = mutableListOf<Request>()
@@ -15,16 +15,17 @@ internal class EnhancementScheduler {
     fun <T> run(
         priority: () -> Int,
         cancelled: () -> Boolean = { Thread.currentThread().isInterrupted },
+        eligible: () -> Boolean = { true },
         block: () -> T,
     ): T? {
-        val request = Request(priority, cancelled)
+        val request = Request(priority, cancelled, eligible)
         synchronized(monitor) {
             pending += request
             try {
                 while (true) {
                     if (cancelled() || Thread.currentThread().isInterrupted) return null
                     // maxByOrNull retains FIFO order when priorities are equal.
-                    val next = pending.filterNot { it.cancelled() }.maxByOrNull { it.priority() }
+                    val next = pending.filter { !it.cancelled() && it.eligible() }.maxByOrNull { it.priority() }
                     if (!running && next === request) {
                         running = true
                         break

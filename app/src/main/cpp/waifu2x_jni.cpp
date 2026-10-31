@@ -1,6 +1,7 @@
 #include "waifu2x.h"
 #include "qnn_backend.h"
 #include "native_log.h"
+#include "inference_control.h"
 #include <android/bitmap.h>
 #include <android/log.h>
 #include <algorithm>
@@ -28,6 +29,7 @@
 
 static Waifu2x *g_waifu2x = nullptr;
 static std::mutex g_lock;
+static InferenceCancellation g_request_cancellation;
 static std::atomic<int> g_last_process_engine{0}; // 0=none, 1=Vulkan, 2=QNN
 static std::atomic<int> g_progress{0};
 static std::atomic<int> g_current_id{-1};
@@ -301,7 +303,7 @@ extern "C" JNIEXPORT jobject JNICALL
 Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                                                             jobject thiz,
                                                             jobject bitmap,
-                                                            jint id) {
+                                                            jint id, jlong token) {
   int ret = -1;
   jobject outBitmap = nullptr;
 
@@ -330,6 +332,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
   // The Kotlin scheduler admits one inference at a time. QNN can read the
   // locked bitmap directly; a second full RGBA allocation is unnecessary.
   std::unique_lock<std::mutex> lock(g_lock);
+  InferenceCancellation::Scope request_scope(g_request_cancellation, static_cast<uint64_t>(token), g_abort_processing);
   const bool qnn_active = qnn_backend::is_initialized();
 
   const int w = info.width;
@@ -703,9 +706,10 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeInitRealCugan(
 extern "C" JNIEXPORT jobject JNICALL
 Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcessRealCugan(
     JNIEnv *env, jobject thiz, jobject bitmap, jint id) {
-  // Real-CUGAN uses same processing logic as Waifu2x in this simplified impl
+  // Legacy entry point has no request token. Current Kotlin callers use
+  // nativeProcess directly for every model, including Real-CUGAN.
   return Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(
-      env, thiz, bitmap, id);
+      env, thiz, bitmap, id, 0);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -904,4 +908,14 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeWasAborted(JNIEnv *, jobject
 extern "C" JNIEXPORT jint JNICALL
 Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeGetLastProcessEngine(JNIEnv *, jobject) {
   return g_last_process_engine.load();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeCancelRequest(JNIEnv *, jobject, jlong token) {
+  g_request_cancellation.cancel(static_cast<uint64_t>(token));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeSetThermalStatus(JNIEnv *, jobject, jint status) {
+  qnn_backend::set_thermal_status(status);
 }
