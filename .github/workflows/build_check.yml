@@ -34,6 +34,8 @@ jobs:
         run: |
           c++ -std=c++17 -O2 -I app/src/main/cpp app/src/test/cpp/upscale_pixels_test.cpp -o /tmp/upscale-pixels-test
           /tmp/upscale-pixels-test
+          c++ -std=c++17 -O2 -pthread -I app/src/main/cpp -I app/src/main/cpp/include/QNN app/src/test/cpp/inference_control_test.cpp -o /tmp/inference-control-test
+          /tmp/inference-control-test
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest :domain:test :app:assembleDebug -PmihonsyAbi=arm64-v8a
 

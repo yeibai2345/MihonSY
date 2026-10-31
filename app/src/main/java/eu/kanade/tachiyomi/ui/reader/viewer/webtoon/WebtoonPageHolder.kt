@@ -136,7 +136,6 @@ class WebtoonPageHolder(
             page?.let { viewer.activity.onPageLoaded(it) }
         }
         frame.onImageLoadError = { error -> setError(error) }
-        frame.onImagePreview = { onImageDecoded() }
         frame.onScaleChanged = { viewer.activity.hideMenu() }
     }
 
@@ -167,8 +166,6 @@ class WebtoonPageHolder(
             marginStart = margin.toInt()
         }
     }
-
-    fun onViewportChanged() = frame.onEnhancementViewportChanged()
 
     /**
      * Called when the view is recycled and added to the view pool.

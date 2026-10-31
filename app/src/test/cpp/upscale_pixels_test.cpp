@@ -124,6 +124,30 @@ static void gray_and_cache() {
   assert(cache.find(19, model_output.size()) == nullptr);
 }
 
+static void gray_mapping_regression() {
+  std::mt19937 rng(132);
+  // Compare integer and proportional mapping with the original pixel formula,
+  // including unequal axes, shrinking, alpha and padded strides.
+  for (const auto shape : {std::array<int, 4>{7, 13, 21, 39}, {7, 13, 28, 52},
+                           {7, 13, 14, 39}, {7, 13, 19, 43}, {7, 13, 4, 8}}) {
+    const int mw = shape[0], mh = shape[1], w = shape[2], h = shape[3];
+    const int stride = w * 4 + 20;
+    std::vector<uint8_t> mask(mw * mh), pixels(stride * h);
+    for (auto &v : mask) v = rng() % 2;
+    for (auto &v : pixels) v = static_cast<uint8_t>(rng());
+    auto reference = pixels;
+    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+      if (mask[(static_cast<int64_t>(y) * mh / h) * mw + static_cast<int64_t>(x) * mw / w]) {
+        auto *p = reference.data() + y * stride + x * 4;
+        const uint8_t gray = (p[0] * 299 + p[1] * 587 + p[2] * 114) / 1000;
+        p[0] = p[1] = p[2] = gray;
+      }
+    }
+    neutralize(pixels.data(), w, h, stride, mask.data(), mw, mh);
+    assert(pixels == reference);
+  }
+}
+
 static void fp16_and_int8() {
   assert(half_to_float(1) == std::ldexp(1.0f, -24));
   assert(half_to_float(0x3ff) == 1023 * std::ldexp(1.0f, -24));
@@ -192,6 +216,7 @@ int main() {
   conversion_and_edges();
   output_geometry_and_alpha();
   gray_and_cache();
+  gray_mapping_regression();
   fp16_and_int8();
   benchmark();
   std::cout << "Native pixel, alpha, border, gray-mask and cache checks passed.\n";

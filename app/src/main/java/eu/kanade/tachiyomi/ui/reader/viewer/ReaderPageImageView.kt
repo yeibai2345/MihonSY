@@ -5,8 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.PointF
 import android.graphics.RectF
-import android.os.Handler
-import android.os.Looper
 import android.graphics.drawable.Animatable
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
@@ -31,6 +29,12 @@ import coil3.asDrawable
 import coil3.dispose
 import coil3.imageLoader
 import coil3.request.CachePolicy
+import eu.kanade.tachiyomi.data.coil.webtoonEnhancement
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import coil3.request.Disposable
 import coil3.request.ImageRequest
 import coil3.request.crossfade
@@ -47,14 +51,10 @@ import eu.kanade.tachiyomi.data.coil.cropBorders
 import eu.kanade.tachiyomi.data.coil.cropBordersAggressive
 import eu.kanade.tachiyomi.data.coil.customDecoder
 import eu.kanade.tachiyomi.data.coil.enhanced
-import eu.kanade.tachiyomi.data.coil.enhancementPreview
-import eu.kanade.tachiyomi.data.coil.StripEnhancementRequest
-import eu.kanade.tachiyomi.data.coil.stripEnhancement
 import eu.kanade.tachiyomi.data.coil.originalSizeDisplay
 import eu.kanade.tachiyomi.data.coil.pageIndex
 import eu.kanade.tachiyomi.ui.reader.viewer.webtoon.WebtoonSubsamplingImageView
 import eu.kanade.tachiyomi.ui.reader.viewer.webtoon.WebtoonImageCache
-import eu.kanade.tachiyomi.ui.reader.viewer.webtoon.WebtoonStripEnhancer
 import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.util.EnhanceTimings
 import eu.kanade.tachiyomi.util.system.animatorDurationScale
@@ -92,7 +92,6 @@ open class ReaderPageImageView @JvmOverloads constructor(
     private var config: Config? = null
 
     var onImageLoaded: (() -> Unit)? = null
-    var onImagePreview: (() -> Unit)? = null
     var onImageLoadError: ((Throwable?) -> Unit)? = null
     var onScaleChanged: ((newScale: Float) -> Unit)? = null
     var onViewClicked: (() -> Unit)? = null
@@ -142,19 +141,17 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
     private var decodeRequest: Disposable? = null
     private var imageGeneration = 0L
-    private var showingPreview = false
-    private val previewHandler = Handler(Looper.getMainLooper())
+    private var admissionJob: Job? = null
+    private var pendingSource: BufferedSource? = null
 
     private fun cancelImageRequest() {
         imageGeneration++
         decodeRequest?.dispose()
         decodeRequest = null
-        showingPreview = false
-        (pageView as? WebtoonSubsamplingImageView)?.stripEnhancer = null
-    }
-
-    internal fun onEnhancementViewportChanged() {
-        (pageView as? WebtoonSubsamplingImageView)?.stripEnhancer?.updateViewport()
+        admissionJob?.cancel()
+        admissionJob = null
+        pendingSource?.close()
+        pendingSource = null
     }
 
     private fun updateWebtoonHeight(imageWidth: Int, imageHeight: Int, config: Config) {
@@ -525,10 +522,6 @@ open class ReaderPageImageView @JvmOverloads constructor(
                 override fun onReady() {
                     if (generation != imageGeneration) return
                     setupZoom(config)
-                    if (showingPreview) {
-                        onImagePreview?.invoke()
-                        return
-                    }
                     if (isVisibleOnScreen()) landscapeZoom(true)
                     this@ReaderPageImageView.onImageLoaded()
                 }
@@ -552,7 +545,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
             is BufferedSource -> {
                 val preferences = Injekt.get<ReaderPreferences>()
                 val cacheKey = if (isWebtoon && enhancementCacheIdentity.isNotEmpty()) {
-                    "$enhancementCacheIdentity|${this@ReaderPageImageView.width}|$config|${preferences.enhancementCacheKey()}"
+                    "$enhancementCacheIdentity|${resources.configuration.screenWidthDp}:${resources.configuration.densityDpi}|$config|${preferences.enhancementCacheKey()}"
                 } else {
                     null
                 }
@@ -607,38 +600,14 @@ open class ReaderPageImageView @JvmOverloads constructor(
 
                 val startTime = android.os.SystemClock.uptimeMillis()
                 val requestPageIndex = this@ReaderPageImageView.pageIndex
-                var previewFinished = false
-                var previewSourceWidth = 0
-                var previewSourceHeight = 0
-                val stripRequest = if (this@ReaderPageImageView.isWebtoon) StripEnhancementRequest() else null
-                ImageRequest.Builder(context)
+                val waitForAdmission = isWebtoon && preferences.enhancementMode.get() == 5
+                val request = ImageRequest.Builder(context)
                     .data(data)
                     .memoryCachePolicy(CachePolicy.DISABLED)
                     .diskCachePolicy(CachePolicy.DISABLED)
                     .enhanced(true)
                     .customDecoder(true)
-                    .stripEnhancement(stripRequest)
-                    .enhancementPreview(
-                        if (this@ReaderPageImageView.isWebtoon) {
-                            { preview ->
-                                previewHandler.post {
-                                    if (generation != imageGeneration || previewFinished) {
-                                        preview.bitmap.recycle()
-                                    } else {
-                                        previewSourceWidth = preview.sourceWidth
-                                        previewSourceHeight = preview.sourceHeight
-                                        showingPreview = true
-                                        setImage(ImageSource.bitmap(preview.bitmap))
-                                        updateWebtoonHeight(preview.sourceWidth, preview.sourceHeight, config)
-                                        isVisible = true
-                                        onImagePreview?.invoke()
-                                    }
-                                }
-                            }
-                        } else {
-                            null
-                        },
-                    )
+                    .webtoonEnhancement(waitForAdmission)
                     // Komiho: webtoon 原始尺寸模式（1:1 显示）不下调 AI 面积回缩 ——
                     // 没有缩小就没有摩尔纹，回缩只会丢细节。
                     .originalSizeDisplay(config.minimumScaleType == SubsamplingScaleImageView.SCALE_TYPE_ORIGINAL_SIZE)
@@ -647,44 +616,17 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     .target(
                         onSuccess = { result ->
                             if (generation != imageGeneration) return@target
-                            previewFinished = true
-                            showingPreview = false
                             val image = result as BitmapImage
                             setImage(if (isWebtoon) ImageSource.cachedBitmap(image.bitmap) else ImageSource.bitmap(image.bitmap))
                             isVisible = true
-                            val stripPlan = stripRequest?.plan
-                            if (stripPlan != null && this is WebtoonSubsamplingImageView) {
-                                updateWebtoonHeight(image.bitmap.width, image.bitmap.height, config)
-                                currentImageEnhanced = false
-                                stripEnhancer = WebtoonStripEnhancer(
-                                    this, image.bitmap, stripPlan, preferences, requestPageIndex,
-                                    cacheKey ?: "strip:$requestPageIndex",
-                                    onVisiblePending = {
-                                        if (generation == imageGeneration) {
-                                            currentImageEnhanced = false
-                                            enhanceStatusView?.visibility = View.GONE
-                                        }
-                                    },
-                                ) { elapsed, engine ->
-                                    if (generation == imageGeneration) {
-                                        currentImageEnhanced = true
-                                        showEnhancementOutcome(
-                                            true, elapsed, "${stripPlan.scale}x · ${context.getString(R.string.reader_enhancement_visible_area)}", engine,
-                                        )
-                                    }
-                                }
-                                onImagePreview?.invoke()
-                                invalidate()
-                                return@target
-                            }
                             // Komiho: webtoon 条目是 WRAP_CONTENT，NPU 增强是同步解码，
                             // 常在 holder 还离屏（高度已量到 0）时就跑完。若此刻不把视图高度
                             // 定下来，增强图会落进 0 高度 SSIV，要等下次 RV 布局（滚进可视区）
                             // 才撑开 —— 表现就是「滚到才显示」。这里按 bitmap 宽高比预置真实
                             // 高度并立即 requestLayout，让增强图一算完就显示。
                             updateWebtoonHeight(
-                                previewSourceWidth.takeIf { it > 0 } ?: image.bitmap.width,
-                                previewSourceHeight.takeIf { it > 0 } ?: image.bitmap.height,
+                                image.bitmap.width,
+                                image.bitmap.height,
                                 config,
                             )
                             // Komiho: 尺寸门 / HARDWARE / 输入已回收这些「什么都没做」的情况由增强器
@@ -725,7 +667,6 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     .listener(
                         onError = { _, _ ->
                             if (generation != imageGeneration) return@listener
-                            previewFinished = true
                             onImageLoadError(null)
                             // 失败也要回执——否则 holder 的补算在飞标记永远不释放，之后真需要补算时
                             // 会被自己挡住。
@@ -743,8 +684,21 @@ open class ReaderPageImageView @JvmOverloads constructor(
                     .cropBordersAggressive(config.cropBordersAggressive)
                     .crossfade(false)
                     .build()
-                    .let(context.imageLoader::enqueue)
-                    .also { decodeRequest = it }
+                // Hold only the compressed source while far off screen. Waiting inside a
+                // decoder would retain large bitmaps and could occupy Coil decoding slots.
+                if (waitForAdmission) {
+                    Waifu2x.ensureThermalMonitoring(context)
+                    pendingSource = data
+                    admissionJob = CoroutineScope(Dispatchers.Main.immediate).launch {
+                        while (generation == imageGeneration && !Waifu2x.canStartWebtoon(requestPageIndex)) delay(100)
+                        if (generation == imageGeneration) {
+                            pendingSource = null // Coil owns and closes the stream after enqueue.
+                            decodeRequest = context.imageLoader.enqueue(request)
+                        }
+                    }
+                } else {
+                    decodeRequest = context.imageLoader.enqueue(request)
+                }
             }
             else -> {
                 throw IllegalArgumentException("Not implemented for class ${data::class.simpleName}")

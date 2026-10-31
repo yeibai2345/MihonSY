@@ -17,9 +17,6 @@ import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
 import eu.kanade.tachiyomi.util.EnhanceTimings
 import eu.kanade.tachiyomi.util.MihonSyEnhancer
 import eu.kanade.tachiyomi.util.waifu2x.Waifu2x
-import eu.kanade.tachiyomi.util.waifu2x.StripUpscalePlan
-import eu.kanade.tachiyomi.util.waifu2x.AiUpscalePlan
-import eu.kanade.tachiyomi.util.waifu2x.UpscaleModelRegistry
 import eu.kanade.tachiyomi.util.storage.CbzCrypto
 import eu.kanade.tachiyomi.util.storage.CbzCrypto.getCoverStream
 import mihon.core.common.archive.archiveReader
@@ -32,7 +29,6 @@ import java.io.BufferedInputStream
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
-import kotlin.math.sqrt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -203,27 +199,6 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
             }
         }
 
-        if (options.stripEnhancement != null && options.enhanced && !options.originalSizeDisplay &&
-            !skipAi && isTallStrip && preferences.enhancementMode.get() == 5
-        ) {
-            UpscaleModelRegistry.ensureScanned(context)
-            val model = UpscaleModelRegistry.findById(preferences.aiModelId.get())
-            val plan = StripUpscalePlan.create(
-                bitmap.width, bitmap.height, AiUpscalePlan.normalizeScale(preferences.aiScale.get()),
-                model.scale, model.padding,
-            )
-            if (plan != null) {
-                if (shouldCancel()) {
-                    bitmap.recycle()
-                    throw CancellationException("Reader image request cancelled")
-                }
-                options.stripEnhancement?.plan = plan
-                // Keep software pixels for viewport bands. Whole-strip 3x/4x output
-                // is never allocated, and the original is immediately readable.
-                return DecodeResult(bitmap.asImage(), isSampled = sampleSize > 1)
-            }
-        }
-
         // MihonSY: run Lanczos3 enhancement synchronously on the decoded bitmap. The
         // decoder is called on Coil's background thread, so this never blocks the UI.
         // Any failure leaves the original bitmap — a black frame can never appear.
@@ -237,34 +212,6 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
                         // Komiho: AI 跳过门命中 —— 登记 skip，角标显示「跳过」，原图直出。
                         EnhanceTimings.markSkipped(options.pageIndex)
                     } else {
-                        if (preferences.enhancementMode.get() == 5 && !options.originalSizeDisplay) {
-                            options.enhancementPreview?.let { publish ->
-                                // Preview and final decode share the same source read. The small
-                                // independent bitmap stays valid while AI owns the full-size input.
-                                val previewSource = bitmap
-                                var preview: Bitmap? = null
-                                try {
-                                    val ratio = minOf(
-                                        1.0,
-                                        dstWidth.coerceAtLeast(1).toDouble() / previewSource.width,
-                                        sqrt(1_500_000.0 / (previewSource.width.toDouble() * previewSource.height)),
-                                    )
-                                    val scaled = Bitmap.createScaledBitmap(
-                                        previewSource,
-                                        max(1, (previewSource.width * ratio).roundToInt()),
-                                        max(1, (previewSource.height * ratio).roundToInt()),
-                                        true,
-                                    )
-                                    preview = if (scaled === previewSource) previewSource.copy(Bitmap.Config.ARGB_8888, false) else scaled
-                                    preview?.let { publish(EnhancementPreview(it, previewSource.width, previewSource.height)) }
-                                    preview = null // Ownership transferred to the preview callback.
-                                } catch (e: OutOfMemoryError) {
-                                    preview?.recycle()
-                                } catch (e: Exception) {
-                                    preview?.recycle()
-                                }
-                            }
-                        }
                         // Komiho 诊断：来源标识 = 谁发起的 + 第几页。
                         // 用来判断并发增强请求是「同一页被算了两遍」还是「相邻两页各一次」——
                         // 同包内取 top-level 扩展，无需 import。
@@ -285,6 +232,7 @@ class TachiyomiImageDecoder(private val resources: ImageSource, private val opti
                             // Komiho: 页号透传给增强器 —— 角标按页登记引擎，别让并发页互相覆盖。
                             pageIndex = options.pageIndex,
                             shouldCancel = shouldCancel,
+                            canStart = { !options.webtoonEnhancement || Waifu2x.canStartWebtoon(options.pageIndex) },
                         )
                         // Komiho (2026-09-30): AI 面积回缩（防摩尔纹）。SSIV 对 bitmap 源是
                         // 整图双线性缩小、无低通，AI 2x 的高频网点与屏幕像素网格拍频出摩尔纹；
