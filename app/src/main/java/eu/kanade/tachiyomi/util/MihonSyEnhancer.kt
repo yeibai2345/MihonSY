@@ -293,99 +293,83 @@ object MihonSyEnhancer {
         // （解码采样不可避免），且 guided filter 代价与窗口无关，采样后尺寸
         // （~1-3MP）单页仅 ~100-200ms（Fast NLM 方案同尺寸实测 11s，已弃）。
         var src = input
-        val denoiseLevel = preferences.denoiseLevel.get()
-        if (denoiseLevel != 0) {
-            src = denoiseForAi(src, denoiseLevel, sourceTag)
-        }
-
-        // Komiho (2026-10-01): AI 灰度掩膜 —— 电子漫画网点经 HTP 管线后通道发散，表现为网点
-        // 边缘的彩色色块。推理前把「近灰度像素」钳位为中性（R=G=B=亮度），推理后把这些像素
-        // 的输出色度中和掉；彩色像素（含彩色漫画整页、页内彩色插图）原样通过，零影响。
-        // 掩膜随结果在 [neutralizeChroma] 消费。
-        // ⚠️ 只对 QNN/HTP 建 —— Vulkan 从未出现色块，且原生 postproc 已整页强制中性，
-        // 在 Vulkan 上这一步是纯开销（判据与依据见 [needsGrayMask]）。
-        var grayMask: Pair<ByteArray, Int>? = null
-        if (mode == 5 && needsGrayMask(preferences)) {
-            val clamped = clampGrayForAi(src)
-            src = clamped.first
-            grayMask = clamped.second
-        }
-
-        val result = when (mode) {
-            // Komiho: 降噪独立档——mode 0 只做降噪不增强（降噪已在上方完成，src 即结果）。
-            0 -> src
-            // MihonSY: Anime4K branch disabled — native side no longer compiled.
-            // 1 -> {
-            //     val a4kMode = preferences.anime4kMode.get()
-            //     val latch = java.util.concurrent.CountDownLatch(1)
-            //     var a4kResult: Bitmap? = null
-            //     var a4kError: Exception? = null
-            //     executor.execute {
-            //         try {
-            //             val argb = ensureArgb(input)
-            //             if (argb != null &&
-            //                 initAnime4K(Injekt.get<Application>(), a4kMode) &&
-            //                 anime4kSupportsSize(argb.width, argb.height, a4kMode)
-            //             ) {
-            //                 a4kResult = nativeProcessAnime4K(argb).takeUnless { it === argb }
-            //             }
-            //         } catch (e: Exception) {
-            //             a4kError = e
-            //         } finally {
-            //             latch.countDown()
-            //         }
-            //     }
-            //     try { latch.await() } catch (e: InterruptedException) { Thread.currentThread().interrupt() }
-            //     if (a4kError != null) { logcat(LogPriority.WARN, a4kError) { "Anime4K enhancement failed" } }
-            //     a4kResult
-            // }
-
-            // MihonSY: CPU resamplers — Lanczos3 (2), Catmull-Rom (3).
-            // (Spline36 (4) disabled; kernel id: 0 = Lanczos3, 1 = Catmull-Rom,
-            //  3 = Mitchell-Netravali（GPU/AI 路线降采样用）native side.)
-            in 2..3 -> {
-                val scale = preferences.lanczosScale.get() / 100f
-                val argb = ensureArgb(src) ?: run {
-                    onComplete?.invoke(false, SystemClock.uptimeMillis() - start, 0L)
-                    return null
-                }
-                if (scale > 1f) {
-                    when (mode) {
-                        3 -> nativeResample(argb, scale, 1)
-                        // MihonSY: Spline36 (4) disabled.
-                        // 4 -> nativeResample(argb, scale, 2)
-                        else -> nativeLanczosProcess(argb, scale)
-                    }.takeUnless { it === argb }
-                } else {
-                    null
-                }
+        var ownedOutput: Bitmap? = null
+        try {
+            val denoiseLevel = preferences.denoiseLevel.get()
+            if (denoiseLevel != 0) {
+                src = denoiseForAi(src, denoiseLevel, sourceTag)
             }
 
-            // GPU / NPU AI upscale, with bounded passes up to the requested scale.
-            5 -> {
-                enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex, shouldCancel, priorityOffset)
+            // Komiho (2026-10-01): AI 灰度掩膜 —— 电子漫画网点经 HTP 管线后通道发散，表现为网点
+            // 边缘的彩色色块。推理前把「近灰度像素」钳位为中性（R=G=B=亮度），推理后把这些像素
+            // 的输出色度中和掉；彩色像素（含彩色漫画整页、页内彩色插图）原样通过，零影响。
+            // 掩膜随结果在 [neutralizeChroma] 消费。
+            // ⚠️ 只对 QNN/HTP 建 —— Vulkan 从未出现色块，且原生 postproc 已整页强制中性，
+            // 在 Vulkan 上这一步是纯开销（判据与依据见 [needsGrayMask]）。
+            var grayMask: Pair<ByteArray, Int>? = null
+            if (mode == 5 && needsGrayMask(preferences)) {
+                val clamped = clampGrayForAi(src)
+                if (src !== input && src !== clamped.first) src.recycle()
+                src = clamped.first
+                grayMask = clamped.second
             }
 
-            else -> null
+            val result = when (mode) {
+                // Komiho: 降噪独立档——mode 0 只做降噪不增强（降噪已在上方完成，src 即结果）。
+                0 -> src
+                // MihonSY: CPU resamplers — Lanczos3 (2), Catmull-Rom (3).
+                // (Spline36 (4) disabled; kernel id: 0 = Lanczos3, 1 = Catmull-Rom,
+                //  3 = Mitchell-Netravali（GPU/AI 路线降采样用）native side.)
+                in 2..3 -> {
+                    val scale = preferences.lanczosScale.get() / 100f
+                    val argb = ensureArgb(src) ?: run {
+                        onComplete?.invoke(false, SystemClock.uptimeMillis() - start, 0L)
+                        return null
+                    }
+                    try {
+                        if (scale > 1f) {
+                            when (mode) {
+                                3 -> nativeResample(argb, scale, 1)
+                                else -> nativeLanczosProcess(argb, scale)
+                            }.takeUnless { it === argb }
+                        } else {
+                            null
+                        }
+                    } finally {
+                        if (argb !== src) argb.recycle()
+                    }
+                }
+
+                // GPU / NPU AI upscale, with bounded passes up to the requested scale.
+                5 -> {
+                    enhanceWithGpu(src, preferences, sourceTag, gpuTiming, pageIndex, shouldCancel, priorityOffset)
+                }
+
+                else -> null
+            }
+            // 降噪产物只被本次增强消费（下游返回的都是新位图，见 enhanceWithGpu / 重采样），
+            // 及时回收，避免大图滞留到 GC。仅当 src 是新位图（≠ input）且不是最终返回对象时回收。
+            // 掩膜在 src 回收前消费：输出色度中和按 src 尺寸缩放掩膜坐标。
+            ownedOutput = result
+            if (grayMask != null && result != null && result !== src) {
+                neutralizeChroma(result, grayMask.first, grayMask.second)
+            }
+            // 只在结果确实是新对象时才缩（避免误 recycle 调用方仍在用的 input）。
+            val capped = if (result != null && result !== input) capOutputSize(result) else result
+            ownedOutput = capped
+            onComplete?.invoke(
+                capped != null && capped !== input,
+                SystemClock.uptimeMillis() - start,
+                // Sum scheduler waiting across every AI pass.
+                gpuTiming?.totalWaitMs() ?: 0L,
+            )
+            if (src === capped) src = input // Transfer a denoise-only result to the caller.
+            ownedOutput = null
+            return capped
+        } finally {
+            ownedOutput?.takeUnless { it === input || it.isRecycled }?.recycle()
+            src.takeUnless { it === input || it.isRecycled }?.recycle()
         }
-        // 降噪产物只被本次增强消费（下游返回的都是新位图，见 enhanceWithGpu / 重采样），
-        // 及时回收，避免大图滞留到 GC。仅当 src 是新位图（≠ input）且不是最终返回对象时回收。
-        // 掩膜在 src 回收前消费：输出色度中和按 src 尺寸缩放掩膜坐标。
-        if (grayMask != null && result != null && result !== src) {
-            neutralizeChroma(result, grayMask.first, grayMask.second)
-        }
-        if (src !== input && (result == null || result !== src)) src.recycle()
-        // 只在结果确实是新对象时才缩（避免误 recycle 调用方仍在用的 input）。
-        val capped = if (result != null && result !== input) capOutputSize(result) else result
-        onComplete?.invoke(
-            capped != null && capped !== input,
-            SystemClock.uptimeMillis() - start,
-            // Komiho: 传「等锁总时长」而不是单纯的 waitMs —— process() 里其实是两次拿 g_lock，
-            // nativeProcess 内部那次排队会被算进 procMs（实测某页 wait=2413 却 proc=4913，
-            // 原生自报只跑了 2449）。角标要剔除的是两段之和，见 Waifu2x.Timing.totalWaitMs()。
-            gpuTiming?.totalWaitMs() ?: 0L,
-        )
-        return capped
     }
 
     /**
@@ -537,7 +521,7 @@ object MihonSyEnhancer {
     }
 
     /**
-     * Komiho (2026-10-01): 本次 AI 增强是否需要 Kotlin 侧的灰度掩膜。
+     * Komiho (2026-10-01): 本次 AI 增强是否需要原生灰度预处理和色度保护。
      *
      * **只有 QNN/HTP（NPU）需要**。HTP 管线的 NHWC 包装与 I/O 量化会让灰度网点的边缘产生
      * 通道发散（彩色色块），**与权重精度无关** —— npu 的 fp16 与 int8 模型都需要（已确认）。
@@ -792,7 +776,7 @@ object MihonSyEnhancer {
 
     /**
      * Komiho (2026-10-01): AI 灰度掩膜（治电子漫画网点色块）。扫描 [src]，把通道发散度
-     * ≤ [GRAY_CHROMA_THRESHOLD] 的像素钳位为中性（R=G=B=亮度），并返回灰度掩膜
+     * ≤ 8 的像素钳位为中性（R=G=B=亮度），并返回灰度掩膜
      * (ByteArray, srcWidth) 供 [neutralizeChroma] 在推理输出上消费。彩色像素原样保留、
      * 掩膜记 0 —— 彩色漫画整页掩膜近似空集，行为与无掩膜完全一致。
      *

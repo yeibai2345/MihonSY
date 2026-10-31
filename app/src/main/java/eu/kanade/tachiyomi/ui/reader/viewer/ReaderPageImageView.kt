@@ -534,6 +534,7 @@ open class ReaderPageImageView @JvmOverloads constructor(
                 }
 
                 override fun onImageLoadError(e: Exception) {
+                    if (generation != imageGeneration) return
                     this@ReaderPageImageView.onImageLoadError(e)
                 }
             },
@@ -658,6 +659,12 @@ open class ReaderPageImageView @JvmOverloads constructor(
                                 stripEnhancer = WebtoonStripEnhancer(
                                     this, image.bitmap, stripPlan, preferences, requestPageIndex,
                                     cacheKey ?: "strip:$requestPageIndex",
+                                    onVisiblePending = {
+                                        if (generation == imageGeneration) {
+                                            currentImageEnhanced = false
+                                            enhanceStatusView?.visibility = View.GONE
+                                        }
+                                    },
                                 ) { elapsed, engine ->
                                     if (generation == imageGeneration) {
                                         currentImageEnhanced = true
@@ -795,12 +802,14 @@ open class ReaderPageImageView @JvmOverloads constructor(
             setZoomTransitionDuration(config.zoomDuration.getSystemScaledDuration())
         }
 
+        val generation = imageGeneration
         val request = ImageRequest.Builder(context)
             .data(data)
             .memoryCachePolicy(CachePolicy.DISABLED)
             .diskCachePolicy(CachePolicy.DISABLED)
             .target(
                 onSuccess = { result ->
+                    if (generation != imageGeneration) return@target
                     val drawable = result.asDrawable(context.resources)
                     setImageDrawable(drawable)
                     (drawable as? Animatable)?.start()
@@ -810,12 +819,13 @@ open class ReaderPageImageView @JvmOverloads constructor(
             )
             .listener(
                 onError = { _, result ->
+                    if (generation != imageGeneration) return@listener
                     onImageLoadError(result.throwable)
                 },
             )
             .crossfade(false)
             .build()
-        context.imageLoader.enqueue(request)
+        decodeRequest = context.imageLoader.enqueue(request)
     }
 
     private fun Int.getSystemScaledDuration(): Int {

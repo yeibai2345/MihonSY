@@ -10,6 +10,37 @@
 
 namespace upscale_pixels {
 
+inline float half_to_float(uint16_t value) {
+  const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16;
+  uint32_t exponent = (value >> 10) & 0x1fu;
+  uint32_t mantissa = value & 0x03ffu;
+  uint32_t bits;
+
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {
+      int shift = 0;
+      while ((mantissa & 0x0400u) == 0) {
+        mantissa <<= 1;
+        ++shift;
+      }
+      mantissa &= 0x03ffu;
+      bits = sign | (static_cast<uint32_t>(127 - 14 - shift) << 23) |
+             (mantissa << 13);
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7f800000u | (mantissa << 13);
+  } else {
+    bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+  }
+
+  float result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
+
 inline int reflect(int coordinate, int size) {
   if (size <= 1) return 0;
   if (coordinate >= 0 && coordinate < size) return coordinate;

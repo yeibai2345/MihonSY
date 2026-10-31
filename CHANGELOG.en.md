@@ -6,6 +6,27 @@
 
 [中文](./CHANGELOG.md) | [English](./CHANGELOG.en.md)
 
+## v1.3.1 (MihonSY)
+
+**MihonSY 1.3.1 (13)**
+
+- **Improved** Viewport-based AI bands for eligible long webtoons, focused on everyday 3x and detailed 4x reading.
+- **Improved** Show the original first, then overlay completed regions without changing scroll geometry.
+- **Improved** Bound each inference instead of allocating an entire 3x/4x strip; retain overlap and align the final band before cropping.
+- **Improved** Prefetch one adjacent band in the reading direction and prioritize visible work across pages.
+- **Improved** Reuse completed bands and pages in a bounded reading-session cache, cleared when leaving the webtoon viewer.
+- **Improved** Per-model NPU conversion lookup tables, direct bitmap reads and bounded reuse of actual model output for exactly uniform tiles.
+- **Improved** Native grayscale/chroma protection reduces Java pixel-array allocations; failed NPU initialization uses a short retry cooldown.
+- **Improved** Bounded previews for webtoon images that use whole-image AI processing.
+- **Fixed** Dispose obsolete image requests, reject stale callbacks and stop abandoned regions between inference passes.
+- **Fixed** Session-unique webtoon IDs prevent page-number collisions between chapters.
+- **Fixed** Preserve alpha during grayscale neutralization and correct FP16 subnormal conversion.
+- **Fixed** Release intermediate bitmaps and decoders on failure/cancellation, and serialize engine destruction with inference.
+- **Fixed** Report the actual native backend, label band timings as visible-area work and include pixel conversion/allocation in processing time.
+- **Improved** Regression coverage for band geometry, scale/memory bounds, scheduling, cancellation, tensor pixels, alpha and cache behavior.
+
+3x/4x retain genuine multi-pass AI. Bands apply to eligible long images with supported 2x models outside original-size display; other cases retain the existing decoder. OnePlus Ace 5 inference latency has not been measured, so no millisecond whole-image claim is made.
+
 ## v1.3.0 (MihonSY)
 
 ### Added

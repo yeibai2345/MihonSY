@@ -29,6 +29,7 @@ internal class WebtoonStripEnhancer(
     private val preferences: ReaderPreferences,
     private val pageId: Int,
     private val cacheIdentity: String,
+    private val onVisiblePending: () -> Unit,
     private val onVisibleEnhanced: (Long, Waifu2x.EngineKind) -> Unit,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -205,7 +206,14 @@ internal class WebtoonStripEnhancer(
     }
 
     private fun reportVisible() {
-        if (visible.isEmpty() || visible == reportedVisible || visible.any { it !in tiles }) return
+        if (visible.isEmpty() || visible.any { it !in tiles }) {
+            if (reportedVisible.isNotEmpty()) {
+                reportedVisible = emptyList()
+                onVisiblePending()
+            }
+            return
+        }
+        if (visible == reportedVisible) return
         reportedVisible = visible.toList()
         val entries = visible.mapNotNull(tiles::get)
         onVisibleEnhanced(entries.sumOf { it.elapsedMillis }, entries.last().engine)

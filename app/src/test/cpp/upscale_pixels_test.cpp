@@ -124,6 +124,34 @@ static void gray_and_cache() {
   assert(cache.find(19, model_output.size()) == nullptr);
 }
 
+static void fp16_and_int8() {
+  assert(half_to_float(1) == std::ldexp(1.0f, -24));
+  assert(half_to_float(0x3ff) == 1023 * std::ldexp(1.0f, -24));
+  assert(half_to_float(0x400) == std::ldexp(1.0f, -14));
+  assert(half_to_float(0x3c00) == 1.0f);
+  assert(half_to_float(0xbc00) == -1.0f);
+  assert(std::isinf(half_to_float(0x7c00)));
+  assert(std::isnan(half_to_float(0x7e00)));
+  ConversionTables tables;
+  tables.build([](float v) { return std::clamp(std::lround(v * 200 + 7), 0L, 255L); },
+               [](uint16_t v) { return (static_cast<int>(v) - 9) / 180.0f; }, 256);
+  for (int i = 0; i < 256; ++i) {
+    assert(tables.input[i] == std::clamp(std::lround((i / 255.0f) * 200 + 7), 0L, 255L));
+    assert(tables.output[i] == static_cast<uint8_t>(std::clamp((i - 9) / 180.0f, 0.0f, 1.0f) * 255 + 0.5f));
+  }
+  const uint8_t input[] = {17, 42, 255, 133};
+  uint8_t packed[3]; int coordinates[1];
+  assert(pack_tile(input, 1, 1, 4, 0, 0, 1, tables.input.data(), packed, coordinates) >= 0);
+  uint8_t output[16]{};
+  const uint8_t tensor[] = {12, 50, 255, 12, 50, 255, 12, 50, 255, 12, 50, 255};
+  unpack_tile(tensor, 2, 0, tables.output.data(), output, 8, 0, 0, 2, 2, input, 4, 2);
+  for (int i = 0; i < 4; ++i) {
+    assert(output[i * 4] == tables.output[12]);
+    assert(output[i * 4 + 1] == tables.output[50]);
+    assert(output[i * 4 + 2] == 255 && output[i * 4 + 3] == 133);
+  }
+}
+
 static void benchmark() {
   constexpr int side = 512, scale = 2, output_side = side * scale;
   const int output_stride = output_side * 4;
@@ -164,6 +192,7 @@ int main() {
   conversion_and_edges();
   output_geometry_and_alpha();
   gray_and_cache();
+  fp16_and_int8();
   benchmark();
   std::cout << "Native pixel, alpha, border, gray-mask and cache checks passed.\n";
 }

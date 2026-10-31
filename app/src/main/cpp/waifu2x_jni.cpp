@@ -28,6 +28,7 @@
 
 static Waifu2x *g_waifu2x = nullptr;
 static std::mutex g_lock;
+static std::atomic<int> g_last_process_engine{0}; // 0=none, 1=Vulkan, 2=QNN
 static std::atomic<int> g_progress{0};
 static std::atomic<int> g_current_id{-1};
 static std::atomic<int> g_ui_busy{0};
@@ -304,10 +305,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
   int ret = -1;
   jobject outBitmap = nullptr;
 
-  // Komiho: 位图拷贝与 alpha 探测都是纯 CPU 工作，不需要引擎锁 —— 挪到 g_lock
-  // 之外，让本页的搬运与上一页（可能仍在锁内跑 GPU）的推理重叠，并顺带缩短
-  // 排队（Kotlin 侧记的 wait = nativeClearAbortProcessing + nativeProcess 两段
-  // 等锁之和）。锁内只留真正的推理。
+  // Validate before locking bitmap storage.
   AndroidBitmapInfo info{};
   if (AndroidBitmap_getInfo(env, bitmap, &info) < 0)
     return bitmap;
@@ -355,7 +353,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                                         : static_cast<const uint8_t *>(packed_input.data);
   const int input_stride = qnn_active ? stride : w * 4;
 
-  // Komiho: alpha 探测同样挪出锁 —— 纯 CPU 扫描，只依赖 packed_input。
+  // Detect alpha using the source stride on both backends.
   bool input_has_alpha =
       (info.flags & ANDROID_BITMAP_FLAGS_ALPHA_MASK) !=
       ANDROID_BITMAP_FLAGS_ALPHA_OPAQUE;
@@ -379,6 +377,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
     g_current_id.store(id);
     // Komiho: 本次跑完前先清掉，避免并发下把上一次的纯耗时当成这次的（拿不到就保持 -1）
     g_last_inference_ms.store(-1);
+    g_last_process_engine.store(0);
     g_last_aborted_id.store(-1);
 
     // Komiho: QNN-only 模式下 g_waifu2x 可能尚未加载（ncnn 引擎与 QNN 引擎独立），
@@ -433,12 +432,13 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                                     .count();
             // Komiho: 成功才登记纯耗时（口径与 Vulkan 路径一致，角标据此剔除排队）
             g_last_inference_ms.store(ret == 0 ? (long long)qnn_ms : -1);
+            if (ret == 0) g_last_process_engine.store(2);
             LOGD("QNN HTP processing %s in %lld ms",
                  ret == 0 ? "completed" : "failed",
                  static_cast<long long>(qnn_ms));
           }
 
-          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && packed_input.empty()) {
+          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && g_waifu2x->scale == out_scale && packed_input.empty()) {
             packed_input.create(w, h, (size_t)4u, 1);
             if (!packed_input.empty()) {
               for (int y = 0; y < h; ++y)
@@ -446,7 +446,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                        input_pixels + static_cast<size_t>(y) * input_stride, static_cast<size_t>(w) * 4);
             }
           }
-          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && !packed_input.empty() &&
+          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && g_waifu2x->scale == out_scale && !packed_input.empty() &&
               g_waifu2x->has_gpu_pipeline()) {
             const auto fused_start = std::chrono::steady_clock::now();
             ret = g_waifu2x->process_gpu(packed_input, outPixels,
@@ -457,12 +457,13 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                                       .count();
             // Komiho: 成功才登记纯耗时（失败/被抢占保持 -1，Kotlin 侧退回旧口径）
             g_last_inference_ms.store(ret == 0 ? (long long)fused_ms : -1);
+            if (ret == 0) g_last_process_engine.store(1);
             LOGD("Fused Vulkan processing %s in %lld ms",
                  ret == 0 ? "completed" : "failed",
                  static_cast<long long>(fused_ms));
           }
 
-          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && !packed_input.empty()) {
+          if (ret != 0 && !g_abort_processing.load() && g_waifu2x && g_waifu2x->scale == out_scale && !packed_input.empty()) {
             LOGD("Fused GPU pipeline unavailable for this image; retrying staged path");
             const auto staged_start = std::chrono::steady_clock::now();
             ncnn::Mat in = ncnn::Mat::from_pixels(
@@ -475,6 +476,7 @@ Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeProcess(JNIEnv *env,
                                        .count();
             // Komiho: 同上，登记这条回退路径的纯耗时
             g_last_inference_ms.store(ret == 0 ? (long long)staged_ms : -1);
+            if (ret == 0) g_last_process_engine.store(1);
             LOGD("Staged processing %s in %lld ms",
                  ret == 0 ? "completed" : "failed",
                  static_cast<long long>(staged_ms));
@@ -897,4 +899,9 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeWasAborted(JNIEnv *, jobject,
                                                                jint id) {
   return g_last_aborted_id.load() == id ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_eu_kanade_tachiyomi_util_waifu2x_Waifu2x_nativeGetLastProcessEngine(JNIEnv *, jobject) {
+  return g_last_process_engine.load();
 }

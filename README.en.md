@@ -6,7 +6,7 @@
 
 **A manga reader based on [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY), focused on image enhancement, an enhanced webtoon experience and multi-device sync**
 
-Package `eu.kanade.mihonsy` ｜ Version 1.3.0 (12) ｜ Android 8.0+
+Package `eu.kanade.mihonsy` ｜ Version 1.3.1 (13) ｜ Android 8.0+
 
 [English](./README.en.md) | [中文](./README.md)
 
@@ -28,7 +28,7 @@ MihonSY is a fork of [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY). It
 
 ### 1. Image Enhancement
 
-- **AI upscaling (GPU)**: ncnn + Vulkan, with three built-in models — AnimeVideoMiniV18 / OmniMiniV2 (default) / OmniTurboV15 — with **2x / 3x / 4x / 5x / 6x** output options and automatic scale reduction for large pages.
+- **AI upscaling (GPU)**: ncnn + Vulkan, with three built-in models — AnimeVideoMiniV18 / OmniMiniV2 (default) / OmniTurboV15 — with **2x / 3x / 4x / 5x / 6x** output options with viewport bands for eligible long webtoons and automatic scale reduction for other large pages.
 - **AI upscaling (NPU)**: Qualcomm QNN / HTP hardware acceleration.
 - **Lanczos3 / Catmull-Rom**: classic interpolation with **1.5x / 2x / 2.5x / 3x** ratios (native separable convolution).
 - **Denoise**: an independent switch (off by default), decoupled from enhancement — it smooths luminance only and keeps hue.
@@ -36,6 +36,8 @@ MihonSY is a fork of [TachiyomiSY](https://github.com/jobobby04/TachiyomiSY). It
 - NPU models ship as **separate model-pack APKs**.
 
 ### 2. Webtoon Reading Enhancements
+
+- **Viewport AI bands**: show the original first, prioritize visible regions, prefetch in the reading direction and reuse session results. Overlap and aligned 3x processing preserve band context; no additional switch is needed.
 
 - **Tap scroll distance**: half / 3-4 / full screen (computed from the reader's actual visible height, so tablets scroll a full screen too).
 - **Scroll animation**: 0–1000ms (0 = instant page jump).
