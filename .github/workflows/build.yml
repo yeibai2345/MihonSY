@@ -10,11 +10,18 @@ on:
         type: choice
         options: [ci, unsigned, formal]
         default: ci
+      prerelease:
+        description: "Publish formal mode as a test release without changing latest"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       mode:
         type: string
         default: ci
+      prerelease:
+        type: boolean
+        default: false
 
 concurrency:
   group: mihonsy-${{ github.workflow }}-${{ github.ref }}
@@ -119,8 +126,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease }}
         run: |
+          RELEASE_FLAGS=(--latest)
+          if [ "$RELEASE_PRERELEASE" = "true" ]; then
+            RELEASE_FLAGS=(--prerelease --latest=false)
+          fi
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "MihonSY $RELEASE_VERSION" --latest \
+            --title "MihonSY $RELEASE_VERSION" "${RELEASE_FLAGS[@]}" \
             --notes-file release-assets/RELEASE_NOTES.md \
             release-assets/*.apk release-assets/SHA256SUMS.txt

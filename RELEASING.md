@@ -31,6 +31,8 @@ GPU/NPU 推理需要真机验证，JVM 测试覆盖倍率规划、温控准入�
 1. 更新 `app/build.gradle.kts` 中的 `versionName` 和递增的 `versionCode`。
 2. 在中英文 CHANGELOG 中增加对应的 `## vX.Y.Z` 小节，并更新 `app/src/main/res/raw/changelog_release.xml` 的应用内公告。
 3. 推送代码，手动运行 **Build MihonSY APK**，选择 `formal`。也可在 master 的提交标题中加入 `[release]`。
+可勾选 `prerelease` 生成签名预发布包；该模式不会改变 GitHub latest，适合真机验收前分发测试。默认关闭。
+
 4. 工作流通过单元测试、构建和签名检查后，会创建 `vX.Y.Z` Release，附上 arm64 APK、universal APK 和 SHA-256 校验文件。
 
 同名标签存在时发布会失败，不会删除或覆盖已发布版本。常规 master/preview 构建只上传测试 APK artifact。
